@@ -25,6 +25,9 @@ jobs:
 
       - name: Run tests
         shell: pwsh
+        env:
+          # Windows runner 主控台預設 cp1252，中文訊息會炸 UnicodeEncodeError
+          PYTHONIOENCODING: utf-8
         run: |
           # 安全不变量测试:input 必须空数组、policy 字段必须 null
           node test-hook.cjs
