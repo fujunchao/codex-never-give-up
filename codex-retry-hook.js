@@ -174,7 +174,7 @@
       const [node, d] = q.shift();
       if (!node || d > 8) continue;
       const id = node.memoizedProps && node.memoizedProps.id;
-      if (typeof id === 'string' && KEY_RE.test(id) && CFG.hasOwnProperty(id)) return id;
+      if (typeof id === 'string' && KEY_RE.test(id) && Object.prototype.hasOwnProperty.call(CFG, id)) return id;
       if (node.child) q.push([node.child, d + 1]);
       if (node.sibling && d > 0) q.push([node.sibling, d]);
     }
@@ -182,7 +182,7 @@
     let up = f, d = 0;
     while (up && d++ < 12) {
       const id = up.memoizedProps && up.memoizedProps.id;
-      if (typeof id === 'string' && CFG.hasOwnProperty(id)) return id;
+      if (typeof id === 'string' && Object.prototype.hasOwnProperty.call(CFG, id)) return id;
       up = up.return;
     }
     return null;
@@ -257,14 +257,25 @@
         note(`ipc ${kind}: ${cfg.note} (${p.threadId.slice(0, 8)})`);
         sweep();                                   // 先試 DOM（當前對話走 app 自己的路徑）
         // 2.5 秒後還卡著，就是背景 thread（DOM 沒有它的按鈕）-> 直接送 RPC
+        // 修正：多條對話同時失敗時，全域冷卻會讓後到的 setTimeout 直接放棄，
+        // 而且永不再排 —— 那幾條就永久餓死（handled 永遠 false，也沒有新錯誤來喚醒）。
+        // 改成：冷卻中就重新排程，直到決策核心放行或 thread 已被處理。
+        // 用錯誤時間戳當序號防重複：同 thread 有新錯誤時，舊代定時器自動失效。
         const tid = p.threadId;
-        setTimeout(() => {
-          const st = threads.get(tid);
-          if (!st || st.handled) return;
-          const d2 = brain.decide('ipc:' + kind);
-          if (!d2.click) { note('bg 略過 ' + tid.slice(0, 8) + ': ' + d2.why); return; }
-          if (sendBackgroundRetry(tid)) { d2.commit(); st.handled = true; }
-        }, 2500);
+        const myErrAt = threads.get(tid) ? threads.get(tid).at : 0;
+        const scheduleBg = () => {
+          setTimeout(() => {
+            const st = threads.get(tid);
+            if (!st || st.handled || st.at !== myErrAt) return;   // 已處理或已有新錯誤接手
+            const d2 = brain.decide('ipc:' + kind);
+            if (!d2.click) {
+              scheduleBg();                                       // 冷卻中：重新排，不是放棄
+              return;
+            }
+            if (sendBackgroundRetry(tid)) { d2.commit(); st.handled = true; }
+          }, 2500);
+        };
+        scheduleBg();
       }
     } else if (d.method === 'turn/started' || d.method === 'turn/completed') {
       // 新的 turn 開始/結束就清掉舊的錯誤狀態

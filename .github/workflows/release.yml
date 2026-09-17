@@ -1,0 +1,64 @@
+name: Build Release EXE
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:          # 也允许手动触发
+
+permissions:
+  contents: write             # 创建 release 和上传产物需要
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install aiohttp pyinstaller
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          # 安全不变量测试:input 必须空数组、policy 字段必须 null
+          node test-hook.cjs
+          node test-build.cjs
+          python codex_retry_gui.pyw --selftest
+
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          pyinstaller --onefile --noconsole --name "codex-never-give-up" `
+                      --icon icon.ico --add-data "codex-retry-hook.js;." `
+                      codex_retry_gui.pyw
+
+      - name: Sanity check EXE
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\codex-never-give-up.exe")) {
+            throw "exe not found"
+          }
+          $size = (Get-Item "dist\codex-never-give-up.exe").Length
+          Write-Output "exe size: $([math]::Round($size/1MB, 1)) MB"
+          if ($size -lt 5MB) { throw "exe suspiciously small: $size bytes" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-never-give-up-exe
+          path: dist/codex-never-give-up.exe
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/codex-never-give-up.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
