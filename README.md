@@ -156,6 +156,7 @@ per-thread 的 `cwd` / `collaborationMode` 等欄位，是從**該 thread 自己
 | `localConversation.serverOverloaded.retry` | ∞ | 1s |
 | `localConversation.serverOverloaded.retryCountdown` | ∞ | 1s |
 | `ipc:serverOverloaded`（背景重送） | ∞ | 1s |
+| `ipc:rateLimitExceeded`（背景重送） | ∞ | 1s |
 | `localConversation.writerConflict.retry` | 30 | 2s |
 | `localTaskRow.resumeError.retry` | 30 | 2s |
 | `localConversation.sharedTaskUnavailable.retry` | 10 | 3s |

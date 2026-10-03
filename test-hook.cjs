@@ -59,3 +59,20 @@ console.log('ok  (whitelist / infinite cap / finite cap / cooldown / idle-reset)
   assert.strictEqual(b.stats()[PLAIN].n, 1);
   console.log(`ok  (全域間隔 ${GLOBAL_GAP_MS}ms，擋掉 23ms 的重複送出)`);
 }
+
+// --- rateLimitExceeded（Azure TPM 429，實錄自 rollout 的 codex_error_info）---
+{
+  const { IPC_CFG, GLOBAL_GAP_MS } = require('./codex-retry-hook.js');
+  const RL = 'ipc:rateLimitExceeded';
+  assert.strictEqual(IPC_CFG.rateLimitExceeded.retry, true, 'IPC 分類要放行');
+  assert.strictEqual(CFG[RL].max, Infinity, '上限要無限');
+  let tt = 900000;
+  const b = makeBrain(CFG, () => tt);
+  // 實際節奏由 per-key gapMs 與全域間隔兩者的較大者決定
+  const step = Math.max(CFG[RL].gapMs, GLOBAL_GAP_MS) + 1;
+  for (let i = 0; i < 300; i++) { tt += step; const x = b.decide(RL); assert.ok(x.click, `rl i=${i}`); x.commit(); }
+  // 配額那條依然刻意不重試，別被順手打開
+  assert.strictEqual(IPC_CFG.usageLimitExceeded.retry, false);
+  assert.strictEqual('ipc:usageLimitExceeded' in CFG, false);
+  console.log('ok  (rateLimitExceeded 可重試且無上限；usageLimitExceeded 維持不重試)');
+}

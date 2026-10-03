@@ -28,6 +28,10 @@
     'ipc:internalServerError':       { max: Infinity, gapMs: 2000 },
     'ipc:httpConnectionFailed':      { max: Infinity, gapMs: 1000 },
     'ipc:responseStreamDisconnected':{ max: Infinity, gapMs: 1000 },
+    // token rate limit（TPM，分鐘級窗口）→ codexErrorInfo: rateLimitExceeded，
+    // 實錄自 rollout 存檔的 task_complete error。與 usageLimitExceeded（帳號配額，
+    // 等重置）不同，分鐘級限流等一下就通；反正無限重試，間隔與過載同為 1s。
+    'ipc:rateLimitExceeded':         { max: Infinity, gapMs: 1000 },
 
     // 故意不自動按，理由寫在這裡免得以後有人手癢加回去：
     //   localConversation.usageLimit.retry            配額用完，重按只是空敲，等重置才有用
@@ -44,6 +48,7 @@
     internalServerError:       { retry: true,  gapMs: 2000, note: '上游 5xx' },
     httpConnectionFailed:      { retry: true,  gapMs: 1000, note: '連線失敗' },
     responseStreamDisconnected:{ retry: true,  gapMs: 1000, note: '串流中斷' },
+    rateLimitExceeded:         { retry: true,  gapMs: 1000, note: 'TPM/速率限流（分鐘級窗口，等一下就通）' },
     // 故意不重試：
     usageLimitExceeded:        { retry: false, note: '配額用完，等重置才有用' },
     contextWindowExceeded:     { retry: false, note: 'context 爆了，重試無用' },
