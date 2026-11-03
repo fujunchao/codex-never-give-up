@@ -7,3 +7,6 @@ probe-home/
 *.log
 _MEI*/
 .venv/
+
+# 工作筆記 / 取證產物（含掃描出來的幾十 MB 字串檔），不入庫
+.workbuddy/
