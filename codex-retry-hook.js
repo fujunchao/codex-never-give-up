@@ -154,6 +154,79 @@
       .slice(0, max);
   }
 
+  /* ---------- 模板救援：從 rollout 的 thread_settings_applied 重建 ----------
+   * 26.1027 之後 mcp-request 不再經過 codex-message-from-view 這條 CustomEvent，
+   * 改成直接呼叫 electronBridge.sendMessageFromView（asar 裡 dispatchMessage 仍在，
+   * 但實測整段 turn 只看到 view-focused / persisted-atom-update / log-message /
+   * dynamic-tools-for-thread-start-response，一則 mcp-request 都沒有）→ 送出方向的
+   * 抓取永久靜默失效、模板快取停更，背景重送就永遠「無模板可抄」。
+   * 改用 app-server 自己寫在 rollout 裡的 thread_settings_applied —— 那是
+   * 「這一回合實際套用了什麼設定」的權威記錄。
+   *
+   *   thread/read  -> thread.path（rollout jsonl 路徑）+ cwd / runtimeWorkspaceRoots
+   *   fs/readFile  -> { dataBase64 } -> 解碼 -> 取最後一筆 thread_settings_applied
+   *
+   * 只取 TEMPLATE_FIELDS 裡的欄位；rollout 沒有的（responsesapiClientMetadata /
+   * multiAgentMode / summary）寧缺勿編 —— buildRetryRequest 對缺的欄位就是不放。
+   */
+  const RECOVER = {
+    enabled: true,
+    maxBytes: 24_000_000, // base64 上限，別把 renderer 記憶體撐爆
+    attempts: 3, // 同一筆錯誤最多試幾次救援
+  };
+
+  // 純函式：從 rollout 文字裡取最後一筆 thread_settings（沒有就 null）
+  function settingsFromRollout(text) {
+    if (!text) return null;
+    let last = null;
+    for (const line of text.split("\n")) {
+      if (line.indexOf("thread_settings_applied") === -1) continue;
+      try {
+        const o = JSON.parse(line);
+        const p = o && o.payload;
+        if (p && p.type === "thread_settings_applied" && p.thread_settings)
+          last = p.thread_settings;
+      } catch (e) {
+        /* 壞行跳過，不讓一行毀掉整份 */
+      }
+    }
+    return last;
+  }
+
+  // 純函式：thread_settings -> 模板（只放 TEMPLATE_FIELDS 認得的欄位）
+  function templateFromSettings(settings, info) {
+    if (!settings && !info) return null;
+    const tpl = { hostId: (info && info.hostId) || "local", at: 0 };
+    const cwd = (settings && settings.cwd) || (info && info.cwd);
+    if (cwd) tpl.cwd = cwd;
+    const roots =
+      (settings && settings.runtime_workspace_roots) ||
+      (info && info.runtimeWorkspaceRoots);
+    // 實測：第一筆 thread_settings_applied 的 roots 是 [cwd, visualizations]，
+    // 之後 app 自己續跑時只剩 [visualizations]。cwd 不在 roots 裡是 app 端的怪癖，
+    // 對 workspace-write 沙箱可能造成寫入被拒 —— 這裡把 cwd 補回去（不新增別的）。
+    if (roots) {
+      tpl.runtimeWorkspaceRoots =
+        cwd && roots.indexOf(cwd) === -1 ? [cwd, ...roots] : roots;
+    }
+    if (settings && settings.collaboration_mode)
+      tpl.collaborationMode = settings.collaboration_mode;
+    // 0 / false / null 都是有效值，只有 undefined 才算沒資料
+    if (settings && settings.personality !== undefined)
+      tpl.personality = settings.personality;
+    if (settings && settings.service_tier !== undefined)
+      tpl.serviceTier = settings.service_tier;
+    return Object.keys(tpl).length > 2 ? tpl : null; // 只有 hostId/at 等於沒救到
+  }
+
+  // base64（app-server fs/readFile 的回傳）-> utf-8 文字
+  function decodeBase64Text(b64) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder("utf-8").decode(bytes);
+  }
+
   /* ---------- 決策核心（可單獨測試，不碰 DOM） ---------- */
   function makeBrain(cfg, now) {
     now = now || (() => Date.now());
@@ -202,6 +275,8 @@
         buildRetryRequest,
         buildMinimalRetryRequest,
         pruneTemplates,
+        settingsFromRollout,
+        templateFromSettings,
         RETRY_TRIGGER,
         NULL_FIELDS,
         TEMPLATE_FIELDS,
@@ -343,6 +418,7 @@
         // 用錯誤時間戳當序號防重複：同 thread 有新錯誤時，舊代定時器自動失效。
         const tid = p.threadId;
         const myErrAt = threads.get(tid) ? threads.get(tid).at : 0;
+        let tries = 0;
         const scheduleBg = () => {
           setTimeout(() => {
             const st = threads.get(tid);
@@ -352,10 +428,19 @@
               scheduleBg(); // 冷卻中：重新排，不是放棄
               return;
             }
-            if (sendBackgroundRetry(tid)) {
-              d2.commit();
-              st.handled = true;
-            }
+            tries += 1;
+            sendBackgroundRetry(tid, (sent) => {
+              if (sent) {
+                d2.commit();
+                const cur = threads.get(tid);
+                if (cur) cur.handled = true;
+                return;
+              }
+              // 送不出去（救不到模板 / bridge 壞掉）：給有限次機會，不要無限空轉
+              if (tries < RECOVER.attempts) scheduleBg();
+              else
+                note(`bg 重試放棄，試了 ${tries} 次仍失敗 (${tid.slice(0, 8)})`);
+            });
           }, 2500);
         };
         scheduleBg();
@@ -459,57 +544,77 @@
     });
   }
 
-  function sendBackgroundRetry(threadId) {
+  // 從 thread/read + rollout 重建模板；救不到回 null（不寫快取、不送）
+  // 只有救到 collaborationMode 才算成功 —— 沒有它就可能把 Plan mode 偷偷切回 default。
+  function recoverTemplate(threadId) {
+    if (!RECOVER.enabled) return Promise.resolve(null);
     const short = threadId.slice(0, 8);
-    if (!backgroundSend) {
-      note("bg 已停用，跳過 " + short);
-      return false;
-    }
-    const tpl = templates.get(threadId);
-    if (!tpl) {
-      if (!minimalFallback) {
-        note(
-          "bg 無模板可抄，" +
-            short +
-            " 只記錄不送出" +
-            "（在該對話送一則訊息即可建立模板）",
-        );
-        return false;
-      }
-      // 退路：唯讀讀回 thread 資訊，只用讀到的欄位
-      rpc("thread/read", { threadId }).then((res) => {
+    return rpc("thread/read", { threadId }, 8000)
+      .then((res) => {
         const info = res && (res.thread || res);
-        if (!info || !info.cwd) {
-          note("bg thread/read 沒有可用資訊 " + short);
-          return;
+        if (!info) {
+          note("救模板 thread/read 沒回應 " + short);
+          return null;
         }
-        let msg;
-        try {
-          msg = buildMinimalRetryRequest(
-            threadId,
-            info,
-            () => crypto.randomUUID(),
-            () => Date.now(),
-          );
-        } catch (err) {
-          note("bg 最小組裝失敗 " + short + ": " + err.message);
-          return;
+        // 子代理線程設計上不接受直接輸入，別硬送
+        if (info.canAcceptDirectInput === false) {
+          note("救模板 " + short + " 是子代理（canAcceptDirectInput:false），不送");
+          return null;
         }
-        try {
-          window.electronBridge.sendMessageFromView(msg);
-          note(
-            "bg turn/start 已送出（最小參數，省略 collaborationMode）" + short,
-          );
-        } catch (err) {
-          note("bg 最小送出失敗 " + short + ": " + err);
+        const env =
+          (info.environments && info.environments[0]) || {};
+        const base = {
+          hostId: "local",
+          cwd: info.cwd || env.cwd,
+          runtimeWorkspaceRoots: env.runtimeWorkspaceRoots,
+        };
+        if (!info.path) {
+          note("救模板 " + short + " 沒有 rollout 路徑，救不到 collaborationMode");
+          return null;
         }
+        return rpc("fs/readFile", { path: info.path }, 15000).then((file) => {
+          const b64 = file && file.dataBase64;
+          if (!b64) {
+            note("救模板 fs/readFile 沒回應 " + short);
+            return null;
+          }
+          if (b64.length > RECOVER.maxBytes) {
+            note("救模板 rollout 太大（base64 " + b64.length + "），放棄 " + short);
+            return null;
+          }
+          let text;
+          try {
+            text = decodeBase64Text(b64);
+          } catch (err) {
+            note("救模板解碼失敗 " + short + ": " + err);
+            return null;
+          }
+          const settings = settingsFromRollout(text);
+          if (!settings) {
+            note("救模板 rollout 沒有 thread_settings_applied " + short);
+            return null;
+          }
+          const tpl = templateFromSettings(settings, base);
+          if (!tpl || !tpl.collaborationMode) {
+            note("救模板缺 collaborationMode " + short);
+            return null;
+          }
+          return tpl;
+        });
+      })
+      .catch((err) => {
+        note("救模板失敗 " + short + ": " + err);
+        return null;
       });
-      return false;
-    }
+  }
+
+  function sendWithTemplate(threadId, tpl, finish) {
+    const short = threadId.slice(0, 8);
     const bridge = window.electronBridge;
     if (!bridge || typeof bridge.sendMessageFromView !== "function") {
       note("bg 無法送出：electronBridge 不可用");
-      return false;
+      finish(false);
+      return;
     }
     let msg;
     try {
@@ -521,16 +626,97 @@
       );
     } catch (err) {
       note("bg 組裝失敗 " + short + ": " + err.message);
-      return false;
+      finish(false);
+      return;
     }
     try {
       bridge.sendMessageFromView(msg);
       note("bg turn/start 已送出 " + short + " (" + RETRY_TRIGGER + ")");
-      return true;
+      finish(true);
     } catch (err) {
       note("bg 送出失敗 " + short + ": " + err);
-      return false;
+      finish(false);
     }
+  }
+
+  // 退路（預設關閉）：只放 thread/read 讀到的欄位，缺 collaborationMode
+  function sendMinimalRetry(threadId, finish) {
+    const short = threadId.slice(0, 8);
+    rpc("thread/read", { threadId }).then((res) => {
+      const info = res && (res.thread || res);
+      if (!info || !info.cwd) {
+        note("bg thread/read 沒有可用資訊 " + short);
+        finish(false);
+        return;
+      }
+      let msg;
+      try {
+        msg = buildMinimalRetryRequest(
+          threadId,
+          info,
+          () => crypto.randomUUID(),
+          () => Date.now(),
+        );
+      } catch (err) {
+        note("bg 最小組裝失敗 " + short + ": " + err.message);
+        finish(false);
+        return;
+      }
+      try {
+        window.electronBridge.sendMessageFromView(msg);
+        note("bg turn/start 已送出（最小參數，省略 collaborationMode）" + short);
+        finish(true);
+      } catch (err) {
+        note("bg 最小送出失敗 " + short + ": " + err);
+        finish(false);
+      }
+    });
+  }
+
+  // 送背景重試：先吃快取模板；沒有就從 rollout 救一次；再不行才看 minimalFallback。
+  // done(sent) 保證只被呼叫一次 —— 呼叫端靠它決定要不要 commit 決策核心。
+  function sendBackgroundRetry(threadId, done) {
+    let finished = false;
+    const finish = (ok) => {
+      if (finished) return;
+      finished = true;
+      if (typeof done === "function") done(ok);
+    };
+    const short = threadId.slice(0, 8);
+    if (!backgroundSend) {
+      note("bg 已停用，跳過 " + short);
+      finish(false);
+      return;
+    }
+    const cached = templates.get(threadId);
+    if (cached) {
+      sendWithTemplate(threadId, cached, finish);
+      return;
+    }
+    recoverTemplate(threadId).then((tpl) => {
+      if (tpl) {
+        tpl.at = Date.now();
+        templates.set(threadId, tpl);
+        saveTemplates(); // 救到的模板也落地，下次不用再讀 rollout
+        note(
+          "bg 模板已從 rollout 重建 " +
+            short +
+            "（" +
+            Object.keys(tpl)
+              .filter((k) => k !== "hostId" && k !== "at")
+              .join(",") +
+            "）",
+        );
+        sendWithTemplate(threadId, tpl, finish);
+        return;
+      }
+      if (!minimalFallback) {
+        note("bg 救援失敗，只記錄不送出 " + short);
+        finish(false);
+        return;
+      }
+      sendMinimalRetry(threadId, finish);
+    });
   }
 
   const timer = setInterval(sweep, 700);
@@ -565,6 +751,22 @@
     setMinimalFallback(v) {
       minimalFallback = !!v;
       note("最小參數退路 " + (v ? "啟用" : "停用"));
+    },
+    // 沒有模板時要不要從 rollout 的 thread_settings_applied 重建（新版的唯一來源）
+    setRecovery(v) {
+      RECOVER.enabled = !!v;
+      note("模板救援 " + (v ? "啟用" : "停用"));
+    },
+    recoverTemplate, // 手動救單一 thread（診斷用，例如 recoverTemplate('01a1...')）
+    // 手動立刻重試某個 thread（救急/驗證用）：走跟自動路徑完全一樣的邏輯
+    retryNow(threadId) {
+      return new Promise((resolve) => {
+        sendBackgroundRetry(threadId, (sent) => {
+          const cur = threads.get(threadId);
+          if (sent && cur) cur.handled = true;
+          resolve(sent);
+        });
+      });
     },
     rpc, // 唯讀查詢用，例如 rpc('thread/read',{threadId})
     // 目前偵測到有錯誤在身上的 thread（含背景的）

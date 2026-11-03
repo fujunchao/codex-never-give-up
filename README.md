@@ -136,8 +136,30 @@ per-thread 的 `cwd` / `collaborationMode` 等欄位，是從**該 thread 自己
 `turn/start` 原封快取**下來的，不是編的。快取存在 `localStorage`
 （30 天 TTL、上限 50 筆），所以重開 app 或重載頁面都不會丟。
 
-> 某個 thread 從未被錄到 `turn/start` 時就沒有模板，工具會記錄後停手，不會瞎送。
-> 在那個對話送任何一則訊息即可建立模板。
+**模板的第二個來源（26.1027 之後必要）**：那個快取是靠監聽送出方向派發的
+`codex-message-from-view` CustomEvent 抓到的。26.1027 起，renderer 把 app-server 的
+`mcp-request` 直接送進 `electronBridge.sendMessageFromView`，不再經過那條通道
+（事件本身還在，但只剩 `view-focused` / `persisted-atom-update` / `log-message` 這類
+app 內部訊息 —— 實測連續 28 則沒有一則是 `mcp-request`），所以快取會**停更**。
+沒有模板 → 背景重送永遠「無模板可抄」→ 429 就不會自動重試了。
+
+補救方式是從 app-server 自己寫的 rollout 重建：
+
+```
+thread/read  → thread.path（rollout jsonl）+ cwd / runtimeWorkspaceRoots
+fs/readFile  → { dataBase64 } → 解碼 → 取最後一筆 thread_settings_applied
+```
+
+`thread_settings_applied` 是「這一回合實際套用了什麼設定」的權威記錄，裡面有
+`cwd` / `runtime_workspace_roots` / `collaboration_mode`（含 developer_instructions）/
+`personality` / `service_tier`。只抄這幾個，其餘照舊：policy 欄位全送 `null`、
+`input` 一律空陣列。rollout 沒有的欄位（`responsesapiClientMetadata` /
+`multiAgentMode` / `summary`）寧缺勿編。
+
+救到的模板一樣落地 localStorage，之後同一個 thread 就不用再讀 rollout。
+
+> 兩條來源都拿不到時，工具會記錄後停手，不會瞎送。
+> `thread/read` 回 `canAcceptDirectInput:false` 的子代理線程會被跳過（設計上不接受直接輸入）。
 
 ### 分類靠 i18n key，不靠按鈕文字
 
@@ -191,6 +213,9 @@ __codexRetryHook.threads()             // 目前帶著錯誤狀態的 thread（�
 __codexRetryHook.templates()           // 已快取的 per-thread 模板
 __codexRetryHook.health()              // 掃描次數 / 頁面可見性（診斷節流）
 __codexRetryHook.rpc('thread/read', {threadId})   // 唯讀查 app-server
+__codexRetryHook.recoverTemplate(threadId)        // 從 rollout 重建模板（只讀，回傳模板或 null）
+__codexRetryHook.retryNow(threadId)               // 立刻對某個 thread 重送一次（走跟自動路徑一樣的邏輯）
+__codexRetryHook.setRecovery(false)               // 關掉 rollout 模板救援
 __codexRetryHook.setBackgroundSend(false)         // 關掉背景重送
 __codexRetryHook.stop()
 ```
@@ -260,7 +285,9 @@ python codex_retry_gui.pyw --selftest
 ## 已知限制
 
 - **Codex 每次重開都要重新注入。**（換來的是 Codex 更新不會蓋掉它）
-- 背景重送需要該 thread 有模板；沒有就只記錄不送出。
+- 背景重送需要該 thread 有模板。26.1027 之後模板只能靠 rollout 重建
+  （送出方向的 CustomEvent 已不帶 `mcp-request`），所以需要該對話有 rollout 檔；
+  救不到就只記錄不送出。
 - `setMinimalFallback(true)` 是給沒模板的舊 thread 用的退路，**預設關閉且未經實測** ——
   它會省略 `collaborationMode`（`thread/read` 讀不到），寧可被 server 拒絕也不編造，
   以免把某個在 Plan mode 的對話偷偷切回 default。

@@ -118,3 +118,79 @@ console.log('ok  buildRetryRequest：信封 / 觸發器 / 空 input / policy 全
   assert.deepStrictEqual(h.pruneTemplates([], NOWMS, 50, h.TPL_TTL_MS), []);
   console.log(`ok  pruneTemplates：TTL ${h.TPL_TTL_MS / day} 天 / 上限 ${h.TPL_MAX} 筆 / 壞資料不炸`);
 }
+
+// --- 模板救援：從 rollout 的 thread_settings_applied 重建（新版唯一來源）---
+{
+  const line = (o) => JSON.stringify(o);
+  const settingsEvent = (ts, roots, extra) => ({timestamp: '2026-11-03T01:24:22.246Z', type: 'event_msg',
+    payload: {type: 'thread_settings_applied', thread_id: 'TH-1',
+      thread_settings: {model: 'gpt-6.1-sol', model_provider_id: 'custom', service_tier: 'default',
+        approval_policy: 'never', approvals_reviewer: 'user',
+        permission_profile: {type: 'disabled'}, active_permission_profile: {id: ':danger-full-access'},
+        cwd: 'D:\\augment-projects\\zcode2api-plus', runtime_workspace_roots: roots,
+        reasoning_effort: 'max', reasoning_summary: 'detailed', personality: 'friendly',
+        collaboration_mode: {mode: 'default', settings: {model: 'gpt-6.1-sol',
+          reasoning_effort: 'max', developer_instructions: '<collab>...(長文)...'}},
+        disabled_plugin_ids: [], ...(extra || {})}}});
+
+  // 1. 取最後一筆（前面的 turn 可能設定不同，重試要照最近那一筆）
+  const text = [line({payload: {type: 'task_started'}}),
+                line(settingsEvent(1, ['D:\\p'])),
+                line({payload: {type: 'token_count'}}),
+                line(settingsEvent(2, ['D:\\p', 'C:\\vis']))].join('\n');
+  const s = h.settingsFromRollout(text);
+  assert.deepStrictEqual(s.runtime_workspace_roots, ['D:\\p', 'C:\\vis'], '要取最後一筆');
+  assert.strictEqual(s.collaboration_mode.mode, 'default');
+
+  // 2. 壞行 / 空字串 / 沒有事件 -> null，不炸
+  assert.strictEqual(h.settingsFromRollout(''), null);
+  assert.strictEqual(h.settingsFromRollout('not json\n{broken'), null);
+  assert.strictEqual(h.settingsFromRollout(line({payload: {type: 'token_count'}})), null);
+  assert.strictEqual(h.settingsFromRollout('{"payload":{"type":"thread_settings_applied"}}'), null,
+                     '沒有 thread_settings 就不算');
+
+  // 3. settings -> 模板：只放 TEMPLATE_FIELDS 認得的欄位
+  const tpl = h.templateFromSettings(s, {hostId: 'local', cwd: 'IGNORED', runtimeWorkspaceRoots: ['X']});
+  assert.strictEqual(tpl.hostId, 'local');
+  assert.strictEqual(tpl.cwd, 'D:\\augment-projects\\zcode2api-plus', 'settings 的 cwd 優先');
+  // cwd 不在 roots 裡時補回去（實測 app 續跑會掉）；已在裡面就不重複
+  assert.deepStrictEqual(tpl.runtimeWorkspaceRoots,
+    ['D:\\augment-projects\\zcode2api-plus', 'D:\\p', 'C:\\vis']);
+  const tplDedup = h.templateFromSettings({cwd: 'D:\\p', runtime_workspace_roots: ['D:\\p', 'C:\\vis'],
+                                           collaboration_mode: {mode: 'default'}}, null);
+  assert.deepStrictEqual(tplDedup.runtimeWorkspaceRoots, ['D:\\p', 'C:\\vis'], 'cwd 已在 roots 就不重複');
+  assert.strictEqual(tpl.collaborationMode.mode, 'default');
+  assert.strictEqual(tpl.personality, 'friendly');
+  assert.strictEqual(tpl.serviceTier, 'default');
+  for (const k of ['responsesapiClientMetadata', 'multiAgentMode', 'summary']) {
+    assert.ok(!(k in tpl), `rollout 沒有 ${k} 就不該編造`);
+  }
+  // 模板裡絕不可出現 policy / permission 類欄位
+  for (const k of ['permissions', 'approvalPolicy', 'sandboxPolicy', 'model', 'effort']) {
+    assert.ok(!(k in tpl), `模板不該帶 ${k}`);
+  }
+
+  // 4. 沒 settings 時退回 thread/read 的 cwd（但仍然沒有 collaborationMode -> 呼叫端會擋）
+  const tpl2 = h.templateFromSettings(null, {hostId: 'local', cwd: 'C:\\only-cwd'});
+  assert.strictEqual(tpl2.cwd, 'C:\\only-cwd');
+  assert.ok(!tpl2.collaborationMode, '沒有來源就不該有 collaborationMode');
+  assert.strictEqual(h.templateFromSettings(null, null), null, '什麼都沒有就回 null');
+
+  // 5. 救回來的模板送出去，仍然必須是「空 input + policy 全 null」
+  const m4 = h.buildRetryRequest('TH-1', tpl, uuid, now);
+  const q4 = m4.request.params;
+  assert.deepStrictEqual(q4.input, []);
+  for (const k of h.NULL_FIELDS) assert.strictEqual(q4[k], null, k);
+  assert.strictEqual(q4.turnTrigger, h.RETRY_TRIGGER);
+  assert.deepStrictEqual(q4.collaborationMode, tpl.collaborationMode);
+  assert.strictEqual(q4.serviceTier, 'default');
+
+  // 6. personality/serviceTier 是 null 也算有值（不能因為 falsy 被吃掉）
+  const tpl3 = h.templateFromSettings({cwd: '/p', collaboration_mode: {mode: 'plan'},
+                                       personality: null, service_tier: null}, null);
+  assert.ok('personality' in tpl3 && tpl3.personality === null);
+  assert.ok('serviceTier' in tpl3 && tpl3.serviceTier === null);
+
+  console.log('ok  settingsFromRollout / templateFromSettings：取最後一筆 / 壞行不炸 / 只抄認得的欄位 / 不編造 / 空 input + policy 全 null');
+}
+
