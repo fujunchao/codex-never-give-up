@@ -35,7 +35,7 @@ renderer bundle 裡就是這張表：`LDr = [10, 30, 120, 300]`。而真正讓�
 
 | 層 | 做什麼 |
 |---|---|
-| 偵測 | 監聽 app-server 的 IPC 事件流，用 `codexErrorInfo` + `willRetry:false` 判斷 |
+| 偵測 | 監聽 app-server 的 IPC 事件流，用 `codexErrorInfo` + `willRetry:false` 判斷（23 個變體全表分類，未分類的看訊息） |
 | 當前對話 | 立刻觸發 app 自己的重試按鈕（走官方路徑，最保險） |
 | 背景對話 | 直接送 `turn/start` RPC，不碰 DOM、不切畫面、不影響顯示 |
 
@@ -179,6 +179,9 @@ fs/readFile  → { dataBase64 } → 解碼 → 取最後一筆 thread_settings_a
 | `localConversation.serverOverloaded.retryCountdown` | ∞ | 1s |
 | `ipc:serverOverloaded`（背景重送） | ∞ | 1s |
 | `ipc:rateLimitExceeded`（背景重送） | ∞ | 1s |
+| `ipc:responseTooManyFailedAttempts`（背景重送） | ∞ | 1s |
+| `ipc:responseStreamConnectionFailed`（背景重送） | ∞ | 1s |
+| `ipc:__unknown`（未分類變體的退路） | 5 | 30s |
 | `localConversation.writerConflict.retry` | 30 | 2s |
 | `localTaskRow.resumeError.retry` | 30 | 2s |
 | `localConversation.sharedTaskUnavailable.retry` | 10 | 3s |
@@ -192,13 +195,58 @@ fs/readFile  → { dataBase64 } → 解碼 → 取最後一筆 thread_settings_a
 
 | 錯誤 | 為什麼 |
 |---|---|
-| `usageLimitExceeded` | 配額用完，重敲沒用，要等重置 |
+| `usageLimitExceeded` / `sessionBudgetExceeded` | 配額/預算用完，重敲沒用，要等重置 |
 | `contextWindowExceeded` | context 爆了，重試只是再爆一次 |
-| `misalignmentPolicyViolation` | 政策拒絕，重試無用 |
+| `misalignmentPolicyViolation` / `cyberPolicy` / `bioPolicy` | 政策拒絕，重試無用 |
+| `modelNotFound` / `unauthorized` / `badRequest` / `invalidPrompt` / `sandboxError` | 設定或請求本身有錯，重送只會再錯一次 |
+| `interrupted` / `activeTurnNotSteerable` / `threadRollbackFailed` | 與「等一下就通」無關，別背著人重跑 |
 | `turnRenderError` / `summaryPanelRenderError` | UI 渲染失敗，自動重按會無限空轉 |
 | `localTaskRow.resumeConfigError` | 設定檔有錯，同樣空轉 |
 
 理由寫在原始碼裡，免得日後被「順手加回去」。
+
+### 分類表必須完整（26.1103 的教訓）
+
+app-server 的 `CodexErrorInfo` 在 26.1103 有 23 個變體。表裡漏一個，該錯誤就落進
+「未分類 → 不動作」——**使用者只看到卡住，工具連一行有用的紀錄都沒有**。這正是 429 曾經失手的樣子：
+
+```
+exceeded retry limit, last status: 429 Too Many Requests
+  → codex_error_info: { response_too_many_failed_attempts: { http_status_code: 429 } }
+  → 舊版 IPC_CFG 沒有 responseTooManyFailedAttempts → 「未分類，不動作」
+```
+
+它把 `willRetry` 設成 `false`，也就是 app-server 親口說「我不再試了」—— 那正是本工具該接手的時刻。
+現在它走 `ipc:responseTooManyFailedAttempts`（∞、1s）。另外新增 `ipc:__unknown` 退路：未知變體
+先看訊息，明確的 429 / 5xx / 限流 / 斷線字眼才試，且最多 5 次、間隔 30 秒（永久性字眼優先，
+例如「usage limit」即使含 429 也不試）。
+
+新增變體時三處要一起改：`IPC_CFG`、`ALL_ERROR_VARIANTS`、`test-hook.cjs`（測試會逐一比對，
+漏一個就紅燈）。
+
+### Codex 自己對「裸 429」是零重試（26.1103 實測）
+
+用臨時 `CODEX_HOME` + 本地假上游跑 `codex exec` 得到的實測矩陣（原始取證報告在
+`.workbuddy/analysis/2026-11-09-429-server.md`，該目錄不入庫）：
+
+| 上游 | `Retry-After` | `request_max_retries` / `stream_max_retries` | 實際請求數 |
+|---|---|---|---|
+| 429 | 無 | 預設 | **1**（立刻 `exceeded retry limit`） |
+| 429 | 無 | 50 / 50 | **1**（旋鈕完全無效） |
+| 429 | `1` | 預設 | 6（1+5，間隔恆 1.00s） |
+| 429 | `1` | 預設 / 50 | 持續重試（次數 = `stream_max_retries`，預設 5） |
+| 429 | `60` | 預設 | 間隔 59.9998s，**無上限截斷** |
+| 429 | `abc`（非法） | 預設 | **1**（視同沒有） |
+| 503 / 500 | 無 | 預設 | 30+ / 20+（雙層重試） |
+
+結論：**能不能讓 Codex 自己多試幾次，唯一的外部開關是上游回 `Retry-After`。** 有它，用
+`stream_max_retries` 想抬多高都行；沒有它，`request_max_retries` / `stream_max_retries` 對 429
+一點作用都沒有。所以「救活後 30–90 秒又被 429 打回」不是 hook 的問題，是上游限流窗口比我們的
+重試間隔長 —— 工具側只能靠間隔與上限（`CFG`）硬扛，或去代理層給 429 補一個 `Retry-After`。
+
+另外，`rateLimitExceeded` 與 `responseTooManyFailedAttempts` 都是**終態**變體（都不在
+`Retryable{retry_after}` 分支上），差別只是：前者是上游明確的限流語義，後者是 Codex 自己的
+重試預算耗盡、並把最後一次的 HTTP 狀態碼放在 `httpStatusCode` 裡。
 
 ---
 
@@ -243,6 +291,9 @@ python tools/hotswap.py        # 改完 hook 熱換進正在跑的 Codex，不�
 純翻倍到底。所以把 `stream_max_retries` 設大是**沒有意義的** —— 第 20 次要等十幾個小時。
 `config.toml` 只有 `request_max_retries` / `stream_max_retries` / `stream_idle_timeout_ms`
 三個旋鈕，間隔不可調、沒有環境變數。這是本工具存在的原因。
+
+**而裸 429（沒有 `Retry-After`）更糟：26.1103 實測是零重試**，一個請求就終態，
+上面那張退避表根本用不到（見上一節的實測矩陣）。
 
 重現：`python research/measure429.py 95`
 

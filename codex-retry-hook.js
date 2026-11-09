@@ -34,6 +34,14 @@
     // 實錄自 rollout-…-01a0ffba….jsonl 的 task_complete error。和 usageLimitExceeded（帳號配額，
     // 等重置）不同，這種分鐘級限流等一下就通，值得無限重試。反正無限重試，間隔與過載同為 1s。
     "ipc:rateLimitExceeded": { max: Infinity, gapMs: 1000 },
+    // 26.1103 起 429 不會直接變成 rateLimitExceeded，而是先被 Codex 自己退避重試到
+    // 「exceeded retry limit, last status: 429 Too Many Requests」才以
+    // responseTooManyFailedAttempts 終止（實錄 rollout-…-01a1bf8e….jsonl）。
+    "ipc:responseTooManyFailedAttempts": { max: Infinity, gapMs: 1000 },
+    "ipc:responseStreamConnectionFailed": { max: Infinity, gapMs: 1000 },
+    // 未分類的新變體：靠訊息判斷是暫時性錯誤時走這條，有上限（5 次、間隔 30s），
+    // 免得對真正的永久錯誤無限空轉 —— 但至少不會靜默停手。
+    "ipc:__unknown": { max: 5, gapMs: 30000 },
 
     // 故意不自動按，理由寫在這裡免得以後有人手癢加回去：
     //   localConversation.usageLimit.retry            配額用完，重按只是空敲，等重置才有用
@@ -45,17 +53,133 @@
   // IPC 層的錯誤分類：app-server 的 error 通知直接給 codexErrorInfo，
   // 比按鈕的 i18n key 精確（按鈕文字三種錯誤都是「重試」）。
   // 只有 willRetry:false 才是我們該接手的時機 —— app-server 自己說它放棄了。
+  //
+  // 這張表必須覆蓋 CodexErrorInfo 的全部變體。26.1103 新增了
+  // responseTooManyFailedAttempts（Codex 自己退避重試到超過上限的終態，例如
+  // 「exceeded retry limit, last status: 429 Too Many Requests」），舊版表沒有它，
+  // 於是 429 只記一行「未分類，不動作」——工具就在最該出手的地方靜默失效。
+  // 全表抄自 26.1103.4239.0 的 app-server 二進位（字串在裡面是相鄰排列的）：
+  //   context_window_exceeded / session_budget_exceeded / usage_limit_exceeded /
+  //   rate_limit_exceeded / server_overloaded / model_not_found /
+  //   policy_capacity_unavailable / cyber_policy / bio_policy /
+  //   misalignment_policy_violation / http_connection_failed /
+  //   response_stream_connection_failed / internal_server_error / unauthorized /
+  //   bad_request / invalid_prompt / sandbox_error / response_stream_disconnected /
+  //   response_too_many_failed_attempts / active_turn_not_steerable /
+  //   thread_rollback_failed / interrupted / other
+  // wire 上是 camelCase（rollout 裡才是 snake_case）。新增變體時三處要一起改：
+  // 這張表、ALL_ERROR_VARIANTS、test-hook.cjs 的終態清單。
   const IPC_CFG = {
+    // —— 可重試：暫時性，等一下就通 ——
     serverOverloaded: { retry: true, gapMs: 1000, note: "伺服器/模型滿載" },
+    rateLimitExceeded: { retry: true, gapMs: 1000, note: "TPM/速率限流（分鐘級窗口，等一下就通）" },
+    // 本工具存在的理由：Codex 自己重試 >10 分鐘（實測 1068 秒、TTFT 367 秒）後
+    // 丟出這個終態並把 willRetry 設 false —— 它放棄了，輪到我們接手。
+    responseTooManyFailedAttempts: {
+      retry: true,
+      gapMs: 1000,
+      note: "Codex 內部重試用完（最後一次多半還是 429/5xx）",
+    },
     internalServerError: { retry: true, gapMs: 2000, note: "上游 5xx" },
     httpConnectionFailed: { retry: true, gapMs: 1000, note: "連線失敗" },
+    responseStreamConnectionFailed: {
+      retry: true,
+      gapMs: 1000,
+      note: "串流建立失敗（26.1103 才出現的名字）",
+    },
     responseStreamDisconnected: { retry: true, gapMs: 1000, note: "串流中斷" },
-    rateLimitExceeded: { retry: true, gapMs: 1000, note: "TPM/速率限流（分鐘級窗口，等一下就通）" },
-    // 故意不重試：
-    usageLimitExceeded: { retry: false, note: "配額用完，等重置才有用" },
+    // other 是 catch-all：看訊息決定（429 / 5xx / 限流字眼才試），見 shouldRetryByMessage
+    other: { retry: "auto", note: "未說明的錯誤，依訊息判斷" },
+
+    // —— 刻意不重試：重按只是空轉或燒配額，理由寫在這裡免得以後有人手癢加回去 ——
     contextWindowExceeded: { retry: false, note: "context 爆了，重試無用" },
+    sessionBudgetExceeded: { retry: false, note: "本次會話的預算用完，等新會話" },
+    usageLimitExceeded: { retry: false, note: "配額用完，等重置才有用" },
+    modelNotFound: { retry: false, note: "模型不存在或沒權限，要改設定" },
+    policyCapacityUnavailable: { retry: false, note: "帳號層級的政策容量不足" },
+    cyberPolicy: { retry: false, note: "安全政策拒絕" },
+    bioPolicy: { retry: false, note: "安全政策拒絕" },
     misalignmentPolicyViolation: { retry: false, note: "政策拒絕，重試無用" },
+    unauthorized: { retry: false, note: "認證失效，要用戶重新登入" },
+    badRequest: { retry: false, note: "請求本身有問題，重送只會再錯一次" },
+    invalidPrompt: { retry: false, note: "輸入被拒，重送無用" },
+    sandboxError: { retry: false, note: "沙箱環境問題，重試無用" },
+    activeTurnNotSteerable: { retry: false, note: "該 turn 不允許 steer，與重試無關" },
+    threadRollbackFailed: { retry: false, note: "thread 回滾失敗" },
+    interrupted: { retry: false, note: "用戶主動中斷，不要背著人重跑" },
   };
+
+  // 上面那張表的權威來源（測試會逐一檢查有沒有漏）。順序就是二進位裡 enum 的順序。
+  const ALL_ERROR_VARIANTS = [
+    "contextWindowExceeded",
+    "sessionBudgetExceeded",
+    "usageLimitExceeded",
+    "rateLimitExceeded",
+    "serverOverloaded",
+    "modelNotFound",
+    "policyCapacityUnavailable",
+    "cyberPolicy",
+    "bioPolicy",
+    "misalignmentPolicyViolation",
+    "httpConnectionFailed",
+    "responseStreamConnectionFailed",
+    "internalServerError",
+    "unauthorized",
+    "badRequest",
+    "invalidPrompt",
+    "sandboxError",
+    "responseStreamDisconnected",
+    "responseTooManyFailedAttempts",
+    "activeTurnNotSteerable",
+    "threadRollbackFailed",
+    "interrupted",
+    "other",
+  ];
+
+  /* ---------- 未分類變體的退路 ----------
+   * Codex 每次更新都可能加新變體（26.1103 就加了兩個），而「未分類 → 不動作」
+   * 是最糟的失敗方式：使用者只看到卡住，工具什麼都沒說。所以未知變體先看訊息：
+   * 明確的 429 / 5xx / 限流 / 斷線字眼才試，而且走有上限的 'ipc:__unknown'
+   * （5 次，間隔 30 秒），絕不無限空轉。永久性字眼優先，避免把配額錯誤當限流。
+   */
+  const TRANSIENT_RE =
+    /\b(429|500|502|503|504|rate[ _-]?limit|too many requests|overloaded|at capacity|temporarily unavailable|time[ _-]?out|timed out|connection (reset|refused|closed)|econnreset|etimedout|network error)\b/i;
+  const PERMANENT_RE =
+    /\b(usage limit|quota|context window|context length|token budget|max(imum)? tokens|policy|unauthori[sz]ed|forbidden|invalid|not found|sandbox|compaction)\b/i;
+
+  // 純函式：未分類錯誤的訊息到底該不該重試（永久性字眼優先）
+  function shouldRetryByMessage(msg) {
+    const s = String(msg || "");
+    if (PERMANENT_RE.test(s)) return { retry: false, why: "訊息像永久性錯誤" };
+    if (TRANSIENT_RE.test(s)) return { retry: true, why: "訊息是明確的暫時性訊號" };
+    return { retry: false, why: "訊息沒有暫時性訊號" };
+  }
+
+  // 純函式：把「錯誤變體 + 訊息」變成「要不要重試、走哪條 CFG 路徑、理由」。
+  // 這三件事以前散在 onIpc 的 if/else 裡，未分類變體直接落進「不動作」，
+  // 使用者只看到卡住 —— 現在未分類會看訊息，最多試 'ipc:__unknown' 的上限次數。
+  // why 不含變體名（呼叫端統一用 'ipc <kind>: <why>' 組字，免得同一個名字印兩次）。
+  function decideRetry(cfg, kind, state) {
+    const msg = (state && state.msg) || "";
+    if (!cfg) {
+      const guess = shouldRetryByMessage(msg);
+      if (guess.retry)
+        return {
+          retry: true,
+          cfgKey: "ipc:__unknown",
+          why: `未分類變體，但${guess.why}`,
+        };
+      return { retry: false, why: `未分類變體，${guess.why}，不動作` };
+    }
+    if (cfg.retry === "auto") {
+      const guess = shouldRetryByMessage(msg);
+      if (guess.retry)
+        return { retry: true, cfgKey: "ipc:__unknown", why: guess.why };
+      return { retry: false, why: `${guess.why}，不動作` };
+    }
+    if (!cfg.retry) return { retry: false, why: `${cfg.note}，刻意不重試` };
+    return { retry: true, cfgKey: "ipc:" + kind, why: cfg.note };
+  }
 
   // 背景重送用的常數 —— 全部來自實錄的真實 turn/start，不是推測。
   // 錄到的重試把所有 policy 欄位送 null（app-server 會從 thread 既有狀態解），
@@ -272,6 +396,9 @@
         IDLE_RESET_MS,
         GLOBAL_GAP_MS,
         IPC_CFG,
+        ALL_ERROR_VARIANTS,
+        decideRetry,
+        shouldRetryByMessage,
         buildRetryRequest,
         buildMinimalRetryRequest,
         pruneTemplates,
@@ -402,14 +529,16 @@
         msg: (p.error && p.error.message) || "",
         handled: false,
       });
+      // 決策：cfg.retry 可能是 true / false / "auto"（未說明的錯誤，看訊息）
+      const decision = decideRetry(cfg, kind, threads.get(p.threadId));
+      const short = p.threadId.slice(0, 8);
       if (p.willRetry) {
-        note(
-          `ipc ${kind}: app-server 會自己重試，不插手 (${p.threadId.slice(0, 8)})`,
-        );
-      } else if (!cfg) {
-        note(`ipc ${kind || "?"}: 未分類，不動作 (${p.threadId.slice(0, 8)})`);
-      } else if (cfg.retry) {
-        note(`ipc ${kind}: ${cfg.note} (${p.threadId.slice(0, 8)})`);
+        note(`ipc ${kind}: app-server 會自己重試，不插手 (${short})`);
+      } else if (!decision.retry) {
+        note(`ipc ${kind || "?"}: ${decision.why} (${short})`);
+      } else {
+        const cfgKey = decision.cfgKey; // 'ipc:' + kind，或 'ipc:__unknown'
+        note(`ipc ${kind || "?"}: ${decision.why} → 重試路徑 ${cfgKey} (${short})`);
         sweep(); // 先試 DOM（當前對話走 app 自己的路徑）
         // 2.5 秒後還卡著，就是背景 thread（DOM 沒有它的按鈕）-> 直接送 RPC
         // 修正：多條對話同時失敗時，全域冷卻會讓後到的 setTimeout 直接放棄，
@@ -423,7 +552,7 @@
           setTimeout(() => {
             const st = threads.get(tid);
             if (!st || st.handled || st.at !== myErrAt) return; // 已處理或已有新錯誤接手
-            const d2 = brain.decide("ipc:" + kind);
+            const d2 = brain.decide(cfgKey);
             if (!d2.click) {
               scheduleBg(); // 冷卻中：重新排，不是放棄
               return;
@@ -444,10 +573,6 @@
           }, 2500);
         };
         scheduleBg();
-      } else {
-        note(
-          `ipc ${kind}: ${cfg.note}，刻意不重試 (${p.threadId.slice(0, 8)})`,
-        );
       }
     } else if (d.method === "turn/started" || d.method === "turn/completed") {
       // 新的 turn 開始/結束就清掉舊的錯誤狀態
