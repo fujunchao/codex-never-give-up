@@ -299,6 +299,150 @@
     attempts: 3, // 同一筆錯誤最多試幾次救援
   };
 
+  const HOOK_VERSION = "2026-11-13.chunked-ipc-v1";
+  const HOST_CHUNK_MARKER = "codex-host-chunked-message-v1";
+
+  // 26.1106 的宿主会把大消息拆成 token 分片，window message 不再总是完整信封。
+  // 这里只组装消息；传输确认仍由 Codex 自己发送，避免重复确认干扰应用。
+  function makeHostMessageDecoder({
+    now = () => Date.now(),
+    maxSize = RECOVER.maxBytes,
+    ttlMs = 30_000,
+    onError = () => {},
+  } = {}) {
+    const transfers = new Map();
+    const UNSET = Symbol("unset");
+
+    function saveValue(state, value) {
+      const frame = state.stack.at(-1);
+      if (!frame) {
+        if (state.root !== UNSET) throw new Error("存在多个根值");
+        state.root = value;
+      } else if (frame.type === "array") {
+        frame.value.push(value);
+      } else {
+        if (frame.key === null) throw new Error("对象值缺少键名");
+        // __proto__ 也是普通键，不允许分片数据修改对象原型。
+        Object.defineProperty(frame.value, frame.key, {
+          value, enumerable: true, configurable: true, writable: true,
+        });
+        frame.key = null;
+      }
+    }
+
+    function setKey(state, key) {
+      const frame = state.stack.at(-1);
+      if (!frame || frame.type !== "object" || frame.key !== null)
+        throw new Error("键名不在对象内或上一键名没有值");
+      frame.key = key;
+    }
+
+    function consume(state, tokens) {
+      if (!Array.isArray(tokens)) throw new Error("缺少 token 数组");
+      for (const token of tokens) {
+        if (!token || typeof token !== "object") throw new Error("无效 token");
+        // 同时限制字符串总量和 token 数量，避免残留或异常消息无限占用内存。
+        state.size += 16 + (typeof token.value === "string" ? token.value.length : 0);
+        if (state.size > maxSize) throw new Error("分片消息超过大小上限");
+        if (state.stringChunks !== null &&
+            token.type !== "string-chunk" && token.type !== "string-end")
+          throw new Error("字符串分片尚未结束");
+        switch (token.type) {
+          case "array-start":
+          case "object-start": {
+            if (state.stack.length >= 100) throw new Error("分片消息嵌套过深");
+            const array = token.type === "array-start";
+            const value = array ? [] : {};
+            saveValue(state, value);
+            state.stack.push({ type: array ? "array" : "object", value, key: null });
+            break;
+          }
+          case "container-end": {
+            const frame = state.stack.pop();
+            if (!frame || (frame.type === "object" && frame.key !== null))
+              throw new Error("容器未匹配或键名缺少值");
+            break;
+          }
+          case "key":
+            if (typeof token.value !== "string") throw new Error("无效键名");
+            setKey(state, token.value);
+            break;
+          case "value":
+            if (token.value !== undefined && token.value !== null &&
+                !["string", "number", "boolean"].includes(typeof token.value))
+              throw new Error("值 token 必须是基本类型");
+            saveValue(state, token.value);
+            break;
+          case "string-start":
+            if (token.target !== "key" && token.target !== "value")
+              throw new Error("无效字符串目标");
+            state.stringChunks = [];
+            state.stringTarget = token.target;
+            break;
+          case "string-chunk":
+            if (state.stringChunks === null || typeof token.value !== "string")
+              throw new Error("字符串分片缺少起点或内容无效");
+            state.stringChunks.push(token.value);
+            break;
+          case "string-end": {
+            if (state.stringChunks === null) throw new Error("字符串缺少起点");
+            const value = state.stringChunks.join("");
+            const target = state.stringTarget;
+            state.stringChunks = null;
+            state.stringTarget = null;
+            if (target === "key") setKey(state, value);
+            else saveValue(state, value);
+            break;
+          }
+          default:
+            throw new Error("未知 token 类型");
+        }
+      }
+    }
+
+    return {
+      read(data) {
+        for (const [id, state] of transfers) {
+          if (now() - state.at >= ttlMs) transfers.delete(id);
+        }
+        if (!data || data.marker !== HOST_CHUNK_MARKER) return data;
+        const { transferId, sequence, kind } = data;
+        if (typeof transferId !== "string" || !Number.isSafeInteger(sequence)) return null;
+        if (kind === "start") {
+          // 官方发送端串行传输；新起点会取代上次未完成的消息。
+          transfers.clear();
+          transfers.set(transferId, {
+            nextSequence: sequence + 1, at: now(), root: UNSET,
+            stack: [], stringChunks: null, stringTarget: null, size: 0,
+          });
+          return null;
+        }
+        const state = transfers.get(transferId);
+        if (!state) return null;
+        try {
+          if (sequence !== state.nextSequence) throw new Error("分片顺序不连续");
+          state.nextSequence += 1;
+          state.at = now();
+          if (kind === "chunk") {
+            consume(state, data.tokens);
+            return null;
+          }
+          if (kind !== "end") throw new Error("未知分片类型");
+          transfers.delete(transferId);
+          if (state.root === UNSET || state.stack.length || state.stringChunks !== null)
+            throw new Error("消息尚未完整结束");
+          return state.root;
+        } catch (error) {
+          transfers.delete(transferId);
+          onError(error.message);
+          return null;
+        }
+      },
+      clear() { transfers.clear(); },
+      pending: () => transfers.size,
+    };
+  }
+
   // 純函式：從 rollout 文字裡取最後一筆 thread_settings（沒有就 null）
   function settingsFromRollout(text) {
     if (!text) return null;
@@ -409,6 +553,9 @@
         TEMPLATE_FIELDS,
         TPL_MAX,
         TPL_TTL_MS,
+        HOOK_VERSION,
+        HOST_CHUNK_MARKER,
+        makeHostMessageDecoder,
       };
     }
     return;
@@ -459,6 +606,16 @@
     log.push(`${new Date().toLocaleTimeString()} ${msg}`);
     if (log.length > 200) log.shift();
     console.log("[codex-retry]", msg);
+  }
+
+  const hostDecoder = makeHostMessageDecoder({
+    onError: (message) => note("ipc 分片解码失败：" + message),
+  });
+  const decodedEvents = new WeakMap();
+  function ipcData(event) {
+    // 错误监听器和所有 RPC 监听器共享同一次组装结果，不能重复消费同一分片。
+    if (!decodedEvents.has(event)) decodedEvents.set(event, hostDecoder.read(event.data));
+    return decodedEvents.get(event);
   }
 
   let sweeps = 0,
@@ -514,7 +671,7 @@
     return null;
   }
   function onIpc(e) {
-    const d = e.data;
+    const d = ipcData(e);
     if (!d || typeof d !== "object" || d.type !== "mcp-notification") return;
     const p = d.params || {};
 
@@ -644,7 +801,7 @@
       const id = crypto.randomUUID();
       let done = false;
       const h = (e) => {
-        const d = e.data;
+        const d = ipcData(e);
         if (!d || typeof d !== "object") return;
         const msg = d.message;
         if (!msg || msg.id !== id) return;
@@ -849,6 +1006,7 @@
   mo.observe(document.documentElement, { childList: true, subtree: true });
 
   window.__codexRetryHook = {
+    version: HOOK_VERSION,
     cfg: CFG,
     // 診斷用：背景視窗會不會被 Chromium 節流，看這兩個值有沒有在動
     health: () => ({
@@ -897,6 +1055,7 @@
     // 目前偵測到有錯誤在身上的 thread（含背景的）
     threads: () => Object.fromEntries(threads),
     stop() {
+      hostDecoder.clear();
       clearInterval(timer);
       mo.disconnect();
       window.removeEventListener("message", onIpc, true);

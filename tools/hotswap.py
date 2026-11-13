@@ -3,6 +3,8 @@ import asyncio, json, pathlib, sys, urllib.request
 import aiohttp
 PORT = 9333
 src = pathlib.Path('codex-retry-hook.js').read_text(encoding='utf-8')
+reload_src = ("window.__codexRetryHook && window.__codexRetryHook.stop(); "
+              "delete window.__codexRetryHook;\n" + src)
 
 async def main():
     with urllib.request.urlopen(f'http://127.0.0.1:{PORT}/json/list', timeout=5) as r:
@@ -28,7 +30,8 @@ async def main():
                     if m.get('id') == 900:
                         break
                 await ws.send_json({'id': 901, 'method': 'Page.addScriptToEvaluateOnNewDocument',
-                                    'params': {'source': src}})
+                                    # 页面重载时旧注入脚本可能先运行，必须先停止旧版再安装新版。
+                                    'params': {'source': reload_src}})
                 while True:
                     m = json.loads(await ws.receive_str())
                     if m.get('id') == 901:

@@ -161,6 +161,26 @@ fs/readFile  → { dataBase64 } → 解碼 → 取最後一筆 thread_settings_a
 > 兩條來源都拿不到時，工具會記錄後停手，不會瞎送。
 > `thread/read` 回 `canAcceptDirectInput:false` 的子代理線程會被跳過（設計上不接受直接輸入）。
 
+### 26.1106：大消息分片导致模板恢复超时
+
+新版 Codex 会把较大的宿主消息拆成 `codex-host-chunked-message-v1` 协议的
+`start` / `chunk` / `end` 分片，通过 token 逐步传回对象和长字符串。
+因此，小型 `thread/read` 可以正常返回，较大的 `fs/readFile` 结果却不会直接出现在
+`window` 消息的 `message.result.dataBase64` 中。
+
+旧脚本只识别完整信封，实际表现为：已经识别 `rateLimitExceeded`，随后连续三次
+记录“救模板 fs/readFile 没回应”，最后放弃重试。一次实际故障中的会话文件约
+6.26 MB；文件读取接口本身正常，问题在于脚本没有组装收到的分片。
+
+现在错误监听和 RPC 共用分片解码结果，只在完整结束后处理消息。分片确认仍由
+Codex 自己发送；乱序、不完整、超限及过期的数据会丢弃。重试模板仍取该会话的
+实际设置，保留原模型和协作模式。
+
+`node test-runtime.cjs` 会隔离回放这条真实令牌限流错误，覆盖完整自动重试路径，
+并检查旧版完整消息、分片通知、子代理及配额错误。构建 EXE 前也运行此测试。
+可以用 `__codexRetryHook.version` 确认当前脚本是否为 `2026-11-13.chunked-ipc-v1`。
+已经运行的旧 EXE 包含旧脚本，需要使用重新构建的 EXE；更新仓库源码不会改变旧 EXE。
+
 ### 分類靠 i18n key，不靠按鈕文字
 
 `serverOverloaded` / `writerConflict` / `sharedTaskUnavailable` 三種錯誤的按鈕**文字完全一樣**
@@ -312,6 +332,7 @@ codex-inject.py          命令列注入器
 run.bat                  Windows 雙擊啟動（不依賴 .pyw 檔案關聯）
 test-hook.cjs            決策核心的測試
 test-build.cjs           RPC 組裝與模板落地的測試
+test-runtime.cjs         分片消息与自动重试完整流程的回归测试
 tools/                   執行期診斷
 research/                當初挖出這些協定細節的探針，每支對應一個發現
 alternatives/            patch-codex-retry.py：直接改 app.asar 的 19 個 byte
@@ -325,6 +346,7 @@ alternatives/            patch-codex-retry.py：直接改 app.asar 的 19 個 by
 ```
 node test-hook.cjs
 node test-build.cjs
+node test-runtime.cjs
 python codex_retry_gui.pyw --selftest
 ```
 

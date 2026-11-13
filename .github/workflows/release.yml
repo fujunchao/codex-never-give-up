@@ -31,8 +31,13 @@ jobs:
         run: |
           # 安全不变量测试:input 必须空数组、policy 字段必须 null
           node test-hook.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node test-build.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node test-runtime.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python codex_retry_gui.pyw --selftest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build EXE
         shell: pwsh
@@ -50,6 +55,11 @@ jobs:
           $size = (Get-Item "dist\codex-never-give-up.exe").Length
           Write-Output "exe size: $([math]::Round($size/1MB, 1)) MB"
           if ($size -lt 5MB) { throw "exe suspiciously small: $size bytes" }
+          $releaseExePath = (Resolve-Path -LiteralPath "dist\codex-never-give-up.exe").Path
+          $selftestProcess = Start-Process -FilePath $releaseExePath -ArgumentList "--selftest" -WindowStyle Hidden -PassThru -Wait
+          if ($selftestProcess.ExitCode -ne 0) {
+            throw "打包程序自检失败，退出码: $($selftestProcess.ExitCode)"
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
