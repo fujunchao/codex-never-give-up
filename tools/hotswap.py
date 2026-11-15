@@ -1,43 +1,30 @@
-"""把改過的 hook 熱換進正在跑的 Codex，不用重開 app。"""
-import asyncio, json, pathlib, sys, urllib.request
+"""将当前脚本热换进 Codex，并核对版本；无需重启应用。"""
+import asyncio
+import json
+import pathlib
+import sys
+import urllib.request
+
 import aiohttp
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from codex_hook import install_hook
+
 PORT = 9333
-src = pathlib.Path('codex-retry-hook.js').read_text(encoding='utf-8')
-reload_src = ("window.__codexRetryHook && window.__codexRetryHook.stop(); "
-              "delete window.__codexRetryHook;\n" + src)
+
 
 async def main():
-    with urllib.request.urlopen(f'http://127.0.0.1:{PORT}/json/list', timeout=5) as r:
-        tg = [t for t in json.loads(r.read())
-              if t.get('type') == 'page' and t.get('webSocketDebuggerUrl')]
-    async with aiohttp.ClientSession() as s:
-        for t in tg:
-            async with s.ws_connect(t['webSocketDebuggerUrl'], max_msg_size=0) as ws:
-                n = [0]
-                async def ev(expr):
-                    n[0] += 1
-                    await ws.send_json({'id': n[0], 'method': 'Runtime.evaluate',
-                                        'params': {'expression': expr, 'returnByValue': True}})
-                    while True:
-                        m = json.loads(await ws.receive_str())
-                        if m.get('id') == n[0]:
-                            return m
-                await ev("window.__codexRetryHook && window.__codexRetryHook.stop(); "
-                         "delete window.__codexRetryHook; 'stopped'")
-                await ws.send_json({'id': 900, 'method': 'Page.enable', 'params': {}})
-                while True:
-                    m = json.loads(await ws.receive_str())
-                    if m.get('id') == 900:
-                        break
-                await ws.send_json({'id': 901, 'method': 'Page.addScriptToEvaluateOnNewDocument',
-                                    # 页面重载时旧注入脚本可能先运行，必须先停止旧版再安装新版。
-                                    'params': {'source': reload_src}})
-                while True:
-                    m = json.loads(await ws.receive_str())
-                    if m.get('id') == 901:
-                        break
-                await ev(src)
-                r2 = await ev("(()=>{const h=window.__codexRetryHook;"
-                              "return h? 'ok cfg='+Object.keys(h.cfg).length : 'MISSING';})()")
-            print(f"  {t.get('url','?')[:60]:62s} {(r2.get('result') or {}).get('result',{}).get('value')}")
-asyncio.run(main())
+    source = (ROOT / 'codex-retry-hook.js').read_text(encoding='utf-8')
+    with urllib.request.urlopen(f'http://127.0.0.1:{PORT}/json/list', timeout=5) as response:
+        targets = [t for t in json.load(response) if t.get('type') == 'page' and t.get('webSocketDebuggerUrl')]
+    if not targets:
+        raise RuntimeError('调试接口中没有可注入的 Codex 页面')
+    async with aiohttp.ClientSession() as session:
+        for target in targets:
+            version = await install_hook(session, target, source)
+            print(f"  {target.get('url', '?')[:60]}  已核对脚本版本：{version}")
+
+
+if __name__ == '__main__':
+    asyncio.run(main())

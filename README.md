@@ -3,10 +3,24 @@
 > **EN:** Unofficial auto-retry for the **OpenAI Codex desktop app** on Windows.
 > When a turn dies with `serverOverloaded` ("Selected model is at capacity"), the app
 > waits 10s → 30s → 120s → 300s, gives up, and leaves a **Retry** button for you to click.
-> This tool retries immediately and indefinitely — for the conversation you are looking at
+> This tool retries with configurable limits and intervals — for the conversation you are looking at
 > *and* for background conversations, where the app itself cannot retry at all.
 > Detection happens on the app-server IPC stream, not by scraping the UI.
 > Not affiliated with OpenAI. See [Disclaimer](#免責).
+
+## 当前版本兼容性
+
+`v1.5.0` 已适配 Windows Codex `26.1111.21308`（MSIX `26.1111.2228.0`，
+内置 CLI `0.169.0-alpha.11.1`）。主注入方案仍然适用：新版在不带 `Retry-After`
+的 HTTP 429 场景下仍只请求一次后失败，即使原生重试上限设为 50 也一样。
+
+本版补齐三个新增错误分类、修复旧脚本升级与新窗口注入，并恢复备用 ASAR 补丁的新版识别。
+当前脚本版本为 `2026-11-15.codex-26.1111-v1`，有 26 个 IPC 分类和 17 条 CFG 规则。
+详见[兼容性报告](docs/compatibility-26.1111.21308.md)和[发布说明](docs/releases/v1.5.0.md)。
+
+Windows 用户可直接下载 [v1.5.0 EXE](https://github.com/fujunchao/codex-never-give-up/releases/download/v1.5.0/codex-never-give-up.exe)。
+替换旧 EXE 后点击“重新注入”；源码更新不会自动改变旧 EXE 内嵌的脚本。
+已有调试端口时，源码用户也可运行 `python tools/hotswap.py` 热换，无需重启 Codex。
 
 ![screenshot](docs/screenshot.png)
 
@@ -24,18 +38,18 @@ Codex 桌面版遇到上游過載時，行為是寫死的：
 第 5 次     → 放棄，丟一顆「重試」按鈕給你手點
 ```
 
-renderer bundle 裡就是這張表：`LDr = [10, 30, 120, 300]`。而真正讓它「停下來」的不是秒數，
-是取值函式 `return LDr[r] ?? null` —— 一旦連續次數超過表長就回 `null`，倒數元件不再渲染，
-整條自動重試路徑消失。
+renderer bundle 里仍保留 `[10, 30, 120, 300]` 倒计时表，压缩后的变量名随版本变化。
+对应 getter 在连续次数超过表长后返回 `null`，停止显示倒计时；新版还受
+`capacityErrorRetries` 能力开关影响。这条界面路径与 app-server 自身的重试是两层机制。
 
 更麻煩的是**背景對話**：那個倒數計時器活在 React 元件裡，元件沒掛載就不會跑。
-所以你沒在看的對話一旦過載，**原版 Codex 永遠不會自己重試**，會一直卡到你切過去。
+因此，app-server 已结束重试后，没在看的对话不能靠这个界面倒计时继续重试。
 
 這個工具做三件事：
 
 | 層 | 做什麼 |
 |---|---|
-| 偵測 | 監聽 app-server 的 IPC 事件流，用 `codexErrorInfo` + `willRetry:false` 判斷（23 個變體全表分類，未分類的看訊息） |
+| 偵測 | 监听 app-server IPC，用 `codexErrorInfo` + `willRetry:false` 判断（当前协议 23 个错误及 3 个旧版错误全部分类，未知类型看消息） |
 | 當前對話 | 立刻觸發 app 自己的重試按鈕（走官方路徑，最保險） |
 | 背景對話 | 直接送 `turn/start` RPC，不碰 DOM、不切畫面、不影響顯示 |
 
@@ -53,8 +67,9 @@ Windows 若沒把 `.pyw` 關聯到 Python，雙擊腳本不會啟動。請雙擊
 pythonw codex_retry_gui.pyw
 ```
 
-按「一鍵注入」。它會關掉 Codex、以 Store 套件啟動方式帶 `--remote-debugging-port` 重開、注入所有視窗，
-之後新開的視窗自動補上。全程沒有主控台黑框。
+按“一键注入”。已有调试端口时直接注入；否则关闭 Codex，再以 Store 套件启动方式
+带 `--remote-debugging-port` 重开，注入所有窗口。之后新开的窗口自动补上。全程没有主控台黑框。
+检测到旧脚本时显示“需重新注入”及实际版本，成功注入后核对运行中的版本。
 
 找不到 Codex 安裝路徑時按鈕是灰的，不會亂跑。
 
@@ -76,6 +91,7 @@ python codex-inject.py --force --watch
 pip install pyinstaller
 pyinstaller --onefile --noconsole --name "codex-never-give-up" --icon icon.ico ^
             --add-data "codex-retry-hook.js;." codex_retry_gui.pyw
+python tools/verify-package.py dist/codex-never-give-up.exe --sha256-file dist/SHA256SUMS.txt
 ```
 
 > Codex 每次重開都要重新注入一次 —— 這是「不修改 app 檔案」換來的代價，
@@ -178,7 +194,8 @@ Codex 自己发送；乱序、不完整、超限及过期的数据会丢弃。�
 
 `node test-runtime.cjs` 会隔离回放这条真实令牌限流错误，覆盖完整自动重试路径，
 并检查旧版完整消息、分片通知、子代理及配额错误。构建 EXE 前也运行此测试。
-可以用 `__codexRetryHook.version` 确认当前脚本是否为 `2026-11-13.chunked-ipc-v1`。
+这项修复首次随 v1.4.0 发布；当前请用 `__codexRetryHook.version` 确认脚本为
+`2026-11-15.codex-26.1111-v1`。
 已经运行的旧 EXE 包含旧脚本，需要使用重新构建的 EXE；更新仓库源码不会改变旧 EXE。
 
 ### 分類靠 i18n key，不靠按鈕文字
@@ -199,6 +216,7 @@ Codex 自己发送；乱序、不完整、超限及过期的数据会丢弃。�
 | `localConversation.serverOverloaded.retryCountdown` | ∞ | 1s |
 | `ipc:serverOverloaded`（背景重送） | ∞ | 1s |
 | `ipc:rateLimitExceeded`（背景重送） | ∞ | 1s |
+| `ipc:flexUnavailable`（Flex 资源不足） | ∞ | 30s |
 | `ipc:responseTooManyFailedAttempts`（背景重送） | ∞ | 1s |
 | `ipc:responseStreamConnectionFailed`（背景重送） | ∞ | 1s |
 | `ipc:__unknown`（未分類變體的退路） | 5 | 30s |
@@ -216,6 +234,7 @@ Codex 自己发送；乱序、不完整、超限及过期的数据会丢弃。�
 | 錯誤 | 為什麼 |
 |---|---|
 | `usageLimitExceeded` / `sessionBudgetExceeded` | 配額/預算用完，重敲沒用，要等重置 |
+| `inferenceHookDenied` / `tooManyDenials` | 推理 hook 明确拒绝或拒绝次数过多，需要先处理拒绝原因 |
 | `contextWindowExceeded` | context 爆了，重試只是再爆一次 |
 | `misalignmentPolicyViolation` / `cyberPolicy` / `bioPolicy` | 政策拒絕，重試無用 |
 | `modelNotFound` / `unauthorized` / `badRequest` / `invalidPrompt` / `sandboxError` | 設定或請求本身有錯，重送只會再錯一次 |
@@ -243,6 +262,20 @@ exceeded retry limit, last status: 429 Too Many Requests
 
 新增變體時三處要一起改：`IPC_CFG`、`ALL_ERROR_VARIANTS`、`test-hook.cjs`（測試會逐一比對，
 漏一個就紅燈）。
+
+### 26.1111：新增错误与独立协议校验
+
+`flexUnavailable` 明确按暂时性错误重试，默认无限次、至少间隔 30 秒，保留原来的
+`serviceTier`（服务层级）。不会自动切换到可能费用不同的标准服务层级。
+`inferenceHookDenied` 和 `tooManyDenials` 明确不重试，即使错误消息包含 429 或 503。
+Flex 资源不足的语义参考官方 [Flex processing](https://developers.openai.com/api/docs/guides/flex-processing)。
+
+`test-protocol.cjs` 会读取本机内置 Codex 导出的真实 `ErrorNotification.json` 样本，
+确认当前 23 个错误全部分类，并保留 `bioPolicy`、`invalidPrompt`、`interrupted` 三个旧版变体。
+以后更新 Codex 时可传入新导出的协议文件重新检查，避免只比较自己维护的分类表。
+
+GUI、CLI 和热换工具共用版本校验；页面重载时，最新版注册脚本会停止并替换旧实例。
+停止后的排队重试与模板恢复不会再发送回合。
 
 ### Codex 自己對「裸 429」是零重試（26.1103 實測）
 
@@ -328,14 +361,17 @@ python tools/hotswap.py        # 改完 hook 熱換進正在跑的 Codex，不�
 ```
 codex-retry-hook.js      注入 renderer 的核心（偵測 + 判斷 + 執行）
 codex_retry_gui.pyw      GUI 注入器
+codex_hook.py            GUI、CLI、热换工具共用的版本检查与注入
 codex-inject.py          命令列注入器
 run.bat                  Windows 雙擊啟動（不依賴 .pyw 檔案關聯）
 test-hook.cjs            決策核心的測試
 test-build.cjs           RPC 組裝與模板落地的測試
 test-runtime.cjs         分片消息与自动重试完整流程的回归测试
+test-protocol.cjs        对照真实新版协议检查错误分类覆盖
+tests/                  注入版本升级、GUI 与 CLI 持续注入测试、真实协议样本
 tools/                   執行期診斷
 research/                當初挖出這些協定細節的探針，每支對應一個發現
-alternatives/            patch-codex-retry.py：直接改 app.asar 的 19 個 byte
+alternatives/            patch-codex-retry.py：识别倒计时表与 getter，等长修改 app.asar
                          （不需注入，但要管理員權限，且每次 Codex 更新都會被蓋掉）
 ```
 
@@ -347,11 +383,17 @@ alternatives/            patch-codex-retry.py：直接改 app.asar 的 19 個 by
 node test-hook.cjs
 node test-build.cjs
 node test-runtime.cjs
+node test-protocol.cjs
+python -m unittest discover -s tests -p 'test_*.py' -v
 python codex_retry_gui.pyw --selftest
+python alternatives/patch-codex-retry.py --selftest
 ```
 
 其中兩條是安全不變式，改動時務必保持綠燈：`input` 必須是空陣列（絕不重送使用者內容）、
 七個 policy 欄位必須是 `null`（不外帶 `permissions`）。
+
+未来版本的协议覆盖检查：`node test-protocol.cjs 路径/ErrorNotification.json`。
+打包校验会同时检查脚本版本与完整源码，只忽略 CRLF/LF 行尾差异；发布附带 EXE 的 SHA-256。
 
 ---
 

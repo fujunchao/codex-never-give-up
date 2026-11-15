@@ -46,7 +46,8 @@ function chunkMessage(message, transferId) {
   return packets;
 }
 
-function createRuntime({ chunked = true, chunkedThread = false, directInput = true } = {}) {
+function createRuntime({ chunked = true, chunkedThread = false, directInput = true,
+                         settings = SETTINGS, responseDelay = 0 } = {}) {
   let clock = 1_000_000;
   let nextId = 0;
   const listeners = new Map();
@@ -71,16 +72,18 @@ function createRuntime({ chunked = true, chunkedThread = false, directInput = tr
       if (message.type === 'mcp-request' && message.request.method === 'thread/read') {
         const response = { type: 'mcp-response', message: {
           id: message.request.id,
-          result: { thread: { id: THREAD_ID, cwd: SETTINGS.cwd, path: 'C:\\sessions\\rollout.jsonl', canAcceptDirectInput: directInput } },
+          result: { thread: { id: THREAD_ID, cwd: settings.cwd, path: 'C:\\sessions\\rollout.jsonl', canAcceptDirectInput: directInput } },
         } };
         const packets = chunkedThread ? chunkMessage(response, message.request.id) : [response];
-        packets.forEach((data, index) => schedule(() => emit('message', { data }), index));
+        packets.forEach((data, index) => schedule(() => emit('message', { data }), responseDelay + index));
       } else if (message.type === 'mcp-request' && message.request.method === 'fs/readFile') {
         const response = { type: 'mcp-response', message: { id: message.request.id, result: {
-          dataBase64: Buffer.from(ROLLOUT).toString('base64'),
+          dataBase64: Buffer.from(JSON.stringify({ type: 'event_msg', payload: {
+            type: 'thread_settings_applied', thread_settings: settings,
+          } })).toString('base64'),
         } } };
         const packets = chunked ? chunkMessage(response, message.request.id) : [response];
-        packets.forEach((data, index) => schedule(() => emit('message', { data }), index));
+        packets.forEach((data, index) => schedule(() => emit('message', { data }), responseDelay + index));
       }
       // 新版应用以 start / chunk / end 分片传回大文件，旧脚本因此误判没有响应。
       return Promise.resolve();
@@ -127,11 +130,12 @@ function createRuntime({ chunked = true, chunkedThread = false, directInput = tr
 }
 
 async function replay({ chunked = true, chunkedThread = false, chunkedError = false, willRetry = false,
-                        directInput = true, errorKind = 'rateLimitExceeded' } = {}) {
-  const runtime = createRuntime({ chunked, chunkedThread, directInput });
+                        directInput = true, errorKind = 'rateLimitExceeded', errorMessage = RATE_ERROR,
+                        settings = SETTINGS } = {}) {
+  const runtime = createRuntime({ chunked, chunkedThread, directInput, settings });
   const notification = { type: 'mcp-notification', method: 'error', params: {
     threadId: THREAD_ID, turnId: TURN_ID, willRetry: false,
-    error: { message: RATE_ERROR, codexErrorInfo: errorKind },
+    error: { message: errorMessage, codexErrorInfo: errorKind },
   } };
   notification.params.willRetry = willRetry;
   const packets = chunkedError ? chunkMessage(notification, 'error-transfer') : [notification];
@@ -158,6 +162,36 @@ async function main() {
   assert.equal((await replay({ errorKind: 'usageLimitExceeded', chunkedError: true })).starts.length, 0, '配额用尽不能因为消息分片而误重试');
   assert.equal((await replay({ directInput: false })).starts.length, 0, '子代理会话仍然跳过');
   console.log('ok  (不抢应用自己的重试；配额错误和子代理会话仍然跳过)');
+
+  assert.equal((await replay({ errorKind: { responseTooManyFailedAttempts: { httpStatusCode: 429 } } })).starts.length,
+               1, '新版对象形式的 429 终态必须被识别');
+  const flex = await replay({ errorKind: 'flexUnavailable', errorMessage: 'Resource unavailable',
+    chunkedError: true, settings: { ...SETTINGS, service_tier: 'flex' } });
+  assert.equal(flex.starts.length, 1);
+  assert.equal(flex.starts[0].request.params.serviceTier, 'flex', 'Flex 重试不能改变服务层级');
+  assert.equal(flex.starts[0].request.params.collaborationMode.mode, 'plan');
+  assert.deepEqual(JSON.parse(JSON.stringify(flex.starts[0].request.params.input)), []);
+  for (const kind of ['inferenceHookDenied', 'tooManyDenials']) {
+    const denied = await replay({ errorKind: kind, errorMessage: '429 upstream temporarily unavailable', chunkedError: true });
+    assert.equal(denied.runtime.requests.length, 0, `${kind} 不应开始模板恢复或重试`);
+  }
+  assert.equal((await replay({ errorKind: 'flexUnavailable', willRetry: true })).starts.length, 0);
+  console.log('ok  (新版 429 对象；Flex 保留服务层级与计划模式；拒绝类型不重试)');
+
+  for (const stopAt of [0, 2500, 2600]) {
+    const stopped = createRuntime({ responseDelay: 100 });
+    stopped.emit('message', { data: { type: 'mcp-notification', method: 'error', params: {
+      threadId: THREAD_ID, turnId: TURN_ID, willRetry: false,
+      error: { message: RATE_ERROR, codexErrorInfo: 'rateLimitExceeded' },
+    } } });
+    await stopped.advance(stopAt);
+    stopped.hook.stop();
+    await stopped.advance(60_000);
+    assert.equal(stopped.requests.filter(m => m.request.method === 'turn/start').length, 0,
+                 `停止时刻 ${stopAt}：排队或恢复中的旧脚本不能继续重试`);
+    assert.equal(await stopped.hook.retryNow(THREAD_ID), false, '已停止的脚本不能被手动重试复活');
+  }
+  console.log('ok  (停止旧脚本后，排队及模板恢复中的重试均不再发送)');
 
   const { makeHostMessageDecoder, HOST_CHUNK_MARKER } = require('./codex-retry-hook.js');
   const decoder = makeHostMessageDecoder();

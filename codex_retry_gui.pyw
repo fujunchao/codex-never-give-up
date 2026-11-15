@@ -6,6 +6,7 @@
 """
 import asyncio, json, os, queue, subprocess, sys, threading, time
 import urllib.request
+from codex_hook import hook_version, install_hook
 
 PORT = 9333
 POLL_MS = 400
@@ -119,7 +120,7 @@ def page_targets():
 
 
 STATS_EXPR = ("(()=>{const h=window.__codexRetryHook;"
-              "return h?JSON.stringify({stats:h.stats(),log:h.log().slice(-6)}):null;})()")
+              "return h?JSON.stringify({version:h.version||null,stats:h.stats(),log:h.log().slice(-6)}):null;})()")
 
 
 async def cdp_eval(session, target, expr):
@@ -134,31 +135,9 @@ async def cdp_eval(session, target, expr):
         return (m.get('result') or {}).get('result', {}).get('value')
 
 
-async def cdp_install(session, target, src):
-    async with session.ws_connect(target['webSocketDebuggerUrl'],
-                                  max_msg_size=0, timeout=15) as ws:
-        n = [0]
-
-        async def call(method, params=None):
-            n[0] += 1
-            await ws.send_json({'id': n[0], 'method': method, 'params': params or {}})
-            while True:
-                m = json.loads(await ws.receive_str())
-                if m.get('id') == n[0]:
-                    return m
-
-        await call('Runtime.evaluate', {'expression':
-                   'window.__codexRetryHook && window.__codexRetryHook.stop();'
-                   'delete window.__codexRetryHook; 0'})
-        await call('Page.enable')
-        # reload / 換頁之後自動再裝一次
-        await call('Page.addScriptToEvaluateOnNewDocument', {'source': src})
-        r = await call('Runtime.evaluate', {'expression': src})
-        if (r.get('result') or {}).get('exceptionDetails'):
-            raise RuntimeError((r['result']['exceptionDetails'] or {}).get('text', '?'))
-        ok = await call('Runtime.evaluate', {'expression': 'typeof window.__codexRetryHook',
-                                             'returnByValue': True})
-        return (ok.get('result') or {}).get('result', {}).get('value') == 'object'
+async def cdp_install(session, target, src, force=True):
+    await install_hook(session, target, src, force=force)
+    return True
 
 
 class Worker(threading.Thread):
@@ -174,6 +153,7 @@ class Worker(threading.Thread):
         # 累計點擊要單調遞增：hook 的 stats 會因為閒置歸零，不能拿來加總。
         # 改成數 log 裡不重複的 click 行。
         self.seen_clicks = set()
+        self.expected_version = hook_version(hook_src())
 
     def say(self, kind, **kw):
         self.out.put(dict(kind=kind, **kw))
@@ -232,20 +212,54 @@ class Worker(threading.Thread):
             if self.exe:
                 self.set_path(P_FOUND, self.exe)
             return
-        lines, live = [], 0
+        # 用户已启动注入后，即使原窗口关闭，也要给所有新窗口补上脚本。
+        if self.injected:
+            src = hook_src()
+            self.expected_version = hook_version(src)
+            for t in [t for t in tg if t['id'] not in self.injected]:
+                try:
+                    if await cdp_install(s, t, src, force=False):
+                        self.injected.add(t['id'])
+                        self.say('log', line='新窗口已补上当前版本脚本')
+                except Exception as e:
+                    self.say('log', line=f'新窗口注入失败：{e}')
+        lines, live, outdated = [], 0, 0
+        old_version = None
         for t in tg:
             try:
                 v = await cdp_eval(s, t, STATS_EXPR)
+                if not v and t['id'] in self.injected:
+                    # 页面重载后实例可能尚未恢复，同一窗口也需要补注入。
+                    await cdp_install(s, t, hook_src(), force=False)
+                    v = await cdp_eval(s, t, STATS_EXPR)
             except Exception:
                 continue
             if not v:
                 continue
-            live += 1
             d = json.loads(v)
+            if d.get('version') != self.expected_version:
+                # 尚未点击注入时只提示；已管理的窗口可自动恢复到当前版本。
+                if t['id'] in self.injected:
+                    try:
+                        await cdp_install(s, t, hook_src(), force=False)
+                        d = json.loads(await cdp_eval(s, t, STATS_EXPR))
+                    except Exception:
+                        pass
+                if d.get('version') != self.expected_version:
+                    outdated += 1
+                    old_version = d.get('version')
+                    continue
+            live += 1
             for line in (d.get('log') or []):
                 if ' click #' in line and line not in self.seen_clicks:
                     self.seen_clicks.add(line)
             lines = d.get('log') or lines
+        if outdated:
+            if self.exe:
+                self.set_path(P_FOUND, self.exe)
+            self.say('state', state='outdated', msg=f'检测到旧脚本（{outdated} 个窗口），请重新注入',
+                     version=old_version or '无版本标记')
+            return
         if not live:
             self.say('state', state='off', msg='Codex 開著但沒注入')
             if self.exe:
@@ -253,21 +267,12 @@ class Worker(threading.Thread):
             return
         self.set_path(P_INJECTED, self.exe)
         self.say('state', state='on', msg=f'運作中（{live} 個視窗）',
-                 clicks=len(self.seen_clicks), log=lines)
-        # 新開的視窗補上 hook
-        if self.injected:
-            src = hook_src()
-            for t in [t for t in tg if t['id'] not in self.injected]:
-                try:
-                    if await cdp_install(s, t, src):
-                        self.injected.add(t['id'])
-                        self.say('log', line='新視窗已補上 hook')
-                except Exception:
-                    pass
+                 clicks=len(self.seen_clicks), log=lines, version=self.expected_version)
 
     async def do_inject(self, s):
         try:
             src = hook_src()
+            self.expected_version = hook_version(src)
         except Exception as e:
             return self.say('state', state='error', msg=str(e))
 
@@ -312,7 +317,7 @@ class Worker(threading.Thread):
             self.say('state', state='error', msg='注入失敗')
 
 
-COLORS = {'off': '#9aa0a6', 'busy': '#e8a33d', 'on': '#2ecc71', 'error': '#e74c3c'}
+COLORS = {'off': '#9aa0a6', 'busy': '#e8a33d', 'outdated': '#e8a33d', 'on': '#2ecc71', 'error': '#e74c3c'}
 PATH_COLORS = {P_SEARCH: '#e8a33d', P_FOUND: '#5b9bf8',
                P_MISSING: '#e74c3c', P_INJECTED: '#2ecc71'}
 FONT = 'Microsoft JhengHei UI'
@@ -343,6 +348,8 @@ def build(root, worker):
 
     clicks = tk.Label(root, text='自動點擊 0 次', bg='#16181d', fg='#8a9099', font=(FONT, 10))
     clicks.pack()
+    versionlbl = tk.Label(root, text='脚本版本：待检测', bg='#16181d', fg='#8a9099', font=('Consolas', 8))
+    versionlbl.pack()
 
     btn = tk.Button(root, text='一鍵注入', bg='#3b82f6', fg='white',
                     activebackground='#2f6fd0', activeforeground='white',
@@ -368,7 +375,7 @@ def build(root, worker):
         allowed = ui['path_state'] in P_OK and ui['run_state'] != 'busy'
         btn.configure(state='normal' if allowed else 'disabled',
                       bg='#3b82f6' if allowed else '#232730',
-                      text='重新注入' if ui['run_state'] == 'on' else '一鍵注入')
+                      text='重新注入' if ui['run_state'] in ('on', 'outdated') else '一鍵注入')
 
     def pump():
         try:
@@ -388,6 +395,8 @@ def build(root, worker):
                     refresh_button()
                     if 'clicks' in m:
                         clicks.configure(text=f'自動點擊 {m["clicks"]} 次')
+                    if 'version' in m:
+                        versionlbl.configure(text=f'脚本版本：{m["version"]}')
                     for line in m.get('log', []):
                         if line not in pump.seen:
                             pump.seen.add(line)
@@ -401,7 +410,7 @@ def build(root, worker):
     pump.seen = set()
     root.after(POLL_MS, pump)
     ui.update({'status': status, 'btn': btn, 'clicks': clicks,
-               'path': pathlbl, 'pump': pump, 'put': put})
+               'path': pathlbl, 'version': versionlbl, 'pump': pump, 'put': put})
     return ui
 
 
@@ -409,6 +418,7 @@ def selftest():
     import tkinter as tk
     assert os.path.exists(os.path.join(res_dir(), 'codex-retry-hook.js')), '少了 hook js'
     assert len(hook_src()) > 500, 'hook js 太短，可能是空檔'
+    expected = hook_version(hook_src())
     w = Worker()
     try:
         root = tk.Tk()
@@ -438,6 +448,10 @@ def selftest():
     feed({'kind': 'path', 'state': P_FOUND})
     assert str(ui['btn'].cget('state')) == 'normal', '找到路徑就該解鎖'
     assert ui['btn'].cget('text') == '一鍵注入'
+    feed({'kind': 'state', 'state': 'outdated', 'msg': '检测到旧脚本，请重新注入', 'version': '无版本标记'})
+    assert ui['btn'].cget('text') == '重新注入'
+    assert str(ui['btn'].cget('state')) == 'normal'
+    assert '无版本标记' in ui['version'].cget('text')
 
     # 處理中 -> 暫時鎖住
     feed({'kind': 'state', 'state': 'busy', 'msg': '注入中…'})
@@ -445,12 +459,13 @@ def selftest():
 
     # 已注入 -> 綠燈、計數、按鈕變重新注入
     feed({'kind': 'path', 'state': P_INJECTED},
-         {'kind': 'state', 'state': 'on', 'msg': '運作中（2 個視窗）', 'clicks': 7})
+         {'kind': 'state', 'state': 'on', 'msg': '運作中（2 個視窗）', 'clicks': 7, 'version': expected})
     assert ui['path'].cget('text') == f'[CODEX路徑:{P_INJECTED}]'
     assert ui['status'].cget('text') == '運作中（2 個視窗）'
     assert '7' in ui['clicks'].cget('text')
     assert ui['btn'].cget('text') == '重新注入'
     assert str(ui['btn'].cget('state')) == 'normal'
+    assert expected in ui['version'].cget('text')
 
     # 副標題已移除
     kids = [c for c in root.winfo_children() if isinstance(c, tk.Label)]

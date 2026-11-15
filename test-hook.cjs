@@ -152,3 +152,28 @@ console.log('ok  (whitelist / infinite cap / finite cap / cooldown / idle-reset)
 
   console.log('ok  (未分類變體看訊息判斷；永久性優先；ipc:__unknown 上限 5 次真的擋得住)');
 }
+
+// 26.1111：错误类型优先于文本，拒绝不能被带有 429/503 的描述误判为重试。
+{
+  const { IPC_CFG, decideRetry, GLOBAL_GAP_MS } = require('./codex-retry-hook.js');
+  for (const kind of ['inferenceHookDenied', 'tooManyDenials']) {
+    for (const msg of ['429 Too Many Requests', '503 temporarily unavailable']) {
+      assert.equal(decideRetry(IPC_CFG[kind], kind, { msg }).retry, false, `${kind} 必须明确停止`);
+    }
+    assert.equal(Object.hasOwn(CFG, `ipc:${kind}`), false);
+  }
+  const flex = decideRetry(IPC_CFG.flexUnavailable, 'flexUnavailable', { msg: 'Resource unavailable' });
+  assert.equal(flex.retry, true, 'Flex 资源不足不应依赖未知错误的文本匹配');
+  assert.equal(flex.cfgKey, 'ipc:flexUnavailable');
+  assert.equal(CFG[flex.cfgKey].gapMs, 30000);
+  assert.equal(CFG[flex.cfgKey].max, Infinity);
+  let time = 3000000;
+  const flexBrain = makeBrain(CFG, () => time);
+  for (let i = 0; i < 200; i++) {
+    const decision = flexBrain.decide(flex.cfgKey);
+    assert.equal(decision.click, true, `Flex 重试不应在第 ${i} 次退回未知错误的五次上限`);
+    decision.commit();
+    time += Math.max(CFG[flex.cfgKey].gapMs, GLOBAL_GAP_MS) + 1;
+  }
+  console.log('ok  (Flex 明确重试且保持 30 秒间隔；两种拒绝不受 429/503 文本影响)');
+}

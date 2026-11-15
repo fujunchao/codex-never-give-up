@@ -17,6 +17,7 @@
 import asyncio, json, pathlib, subprocess, sys, time, urllib.error, urllib.request
 
 import aiohttp
+from codex_hook import hook_version, install_hook
 
 HOOK = pathlib.Path(__file__).with_name('codex-retry-hook.js')
 PORT = 9333
@@ -95,31 +96,13 @@ def http_json(path):
     with urllib.request.urlopen(f'http://127.0.0.1:{PORT}{path}', timeout=3) as r:
         return json.loads(r.read())
 
-async def inject_into(session, target, src):
-    async with session.ws_connect(target['webSocketDebuggerUrl'],
-                                  max_msg_size=0, timeout=15) as ws:
-        async def call(method, params=None, _id=[0]):
-            _id[0] += 1
-            await ws.send_json({'id': _id[0], 'method': method, 'params': params or {}})
-            while True:
-                msg = json.loads(await ws.receive_str())
-                if msg.get('id') == _id[0]:
-                    return msg
-        await call('Page.enable')
-        # 之後每次重新載入（換視窗、reload）都自動再裝一次
-        await call('Page.addScriptToEvaluateOnNewDocument', {'source': src})
-        # 目前這個已經載入的頁面也立刻裝上
-        r = await call('Runtime.evaluate', {'expression': src, 'awaitPromise': False})
-        err = (r.get('result') or {}).get('exceptionDetails')
-        if err:
-            return f"FAILED {target.get('url','?')}: {err.get('text')}"
-        probe = await call('Runtime.evaluate',
-                           {'expression': 'typeof window.__codexRetryHook', 'returnByValue': True})
-        ok = (probe.get('result') or {}).get('result', {}).get('value')
-        return f"{'OK  ' if ok == 'object' else 'HUH '} {target.get('url','?')}  (hook={ok})"
+async def inject_into(session, target, src, force=True):
+    version = await install_hook(session, target, src, force=force)
+    return f"OK   {target.get('url','?')}  (版本={version})"
 
 async def run():
     src = HOOK.read_text(encoding='utf-8')
+    version = hook_version(src)
     exe = app_exe()
 
     try:
@@ -162,14 +145,38 @@ async def run():
 
     print(f'找到 {len(targets)} 個頁面')
     async with aiohttp.ClientSession() as session:
+        seen, failed = set(), 0
         for t in targets:
             try:
                 print('  ' + await inject_into(session, t, src))
+                seen.add(t['id'])
             except Exception as e:
+                failed += 1
                 print(f'  ERR {t.get("url","?")}: {type(e).__name__}: {e}')
-    print('\n注入完成。DevTools console 用 __codexRetryHook.stats() 看狀況。')
+        if failed:
+            sys.exit(f'有 {failed} 个页面注入失败，请查看上述错误。')
+        print(f'\n注入完成，脚本版本 {version}。')
+        if WATCH:
+            print('持续检查新窗口；按 Ctrl+C 停止。')
+            while True:
+                try:
+                    current = [t for t in http_json('/json/list')
+                               if t.get('type') == 'page' and t.get('webSocketDebuggerUrl')]
+                    for t in current:
+                        if t['id'] not in seen:
+                            try:
+                                print('  ' + await inject_into(session, t, src, force=False))
+                                seen.add(t['id'])
+                            except Exception as e:
+                                print(f'新窗口 {t.get("url", "?")} 注入失败：{e}')
+                except Exception as e:
+                    print(f'检查新窗口失败：{e}')
+                await asyncio.sleep(2)
 
 if __name__ == '__main__':
     if not HOOK.exists():
         sys.exit(f'找不到 {HOOK}')
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass

@@ -34,6 +34,8 @@
     // 實錄自 rollout-…-01a0ffba….jsonl 的 task_complete error。和 usageLimitExceeded（帳號配額，
     // 等重置）不同，這種分鐘級限流等一下就通，值得無限重試。反正無限重試，間隔與過載同為 1s。
     "ipc:rateLimitExceeded": { max: Infinity, gapMs: 1000 },
+    // Flex 资源暂时不足：保留服务层级，每次重试至少间隔 30 秒。
+    "ipc:flexUnavailable": { max: Infinity, gapMs: 30000 },
     // 26.1103 起 429 不會直接變成 rateLimitExceeded，而是先被 Codex 自己退避重試到
     // 「exceeded retry limit, last status: 429 Too Many Requests」才以
     // responseTooManyFailedAttempts 終止（實錄 rollout-…-01a1bf8e….jsonl）。
@@ -58,21 +60,16 @@
   // responseTooManyFailedAttempts（Codex 自己退避重試到超過上限的終態，例如
   // 「exceeded retry limit, last status: 429 Too Many Requests」），舊版表沒有它，
   // 於是 429 只記一行「未分類，不動作」——工具就在最該出手的地方靜默失效。
-  // 全表抄自 26.1103.4239.0 的 app-server 二進位（字串在裡面是相鄰排列的）：
-  //   context_window_exceeded / session_budget_exceeded / usage_limit_exceeded /
-  //   rate_limit_exceeded / server_overloaded / model_not_found /
-  //   policy_capacity_unavailable / cyber_policy / bio_policy /
-  //   misalignment_policy_violation / http_connection_failed /
-  //   response_stream_connection_failed / internal_server_error / unauthorized /
-  //   bad_request / invalid_prompt / sandbox_error / response_stream_disconnected /
-  //   response_too_many_failed_attempts / active_turn_not_steerable /
-  //   thread_rollback_failed / interrupted / other
+  // 当前覆盖 26.1111 内置 0.169.0-alpha.11.1 导出协议的 23 个显式变体，
+  // 并保留旧版 bioPolicy / invalidPrompt / interrupted，合计 26 个。
+  // test-protocol.cjs 用真实协议样本核对，避免只比较两张自己维护的表。
   // wire 上是 camelCase（rollout 裡才是 snake_case）。新增變體時三處要一起改：
   // 這張表、ALL_ERROR_VARIANTS、test-hook.cjs 的終態清單。
   const IPC_CFG = {
     // —— 可重試：暫時性，等一下就通 ——
     serverOverloaded: { retry: true, gapMs: 1000, note: "伺服器/模型滿載" },
     rateLimitExceeded: { retry: true, gapMs: 1000, note: "TPM/速率限流（分鐘級窗口，等一下就通）" },
+    flexUnavailable: { retry: true, gapMs: 30000, note: "Flex 资源暂时不足，保留原服务层级" },
     // 本工具存在的理由：Codex 自己重試 >10 分鐘（實測 1068 秒、TTFT 367 秒）後
     // 丟出這個終態並把 willRetry 設 false —— 它放棄了，輪到我們接手。
     responseTooManyFailedAttempts: {
@@ -97,6 +94,8 @@
     usageLimitExceeded: { retry: false, note: "配額用完，等重置才有用" },
     modelNotFound: { retry: false, note: "模型不存在或沒權限，要改設定" },
     policyCapacityUnavailable: { retry: false, note: "帳號層級的政策容量不足" },
+    inferenceHookDenied: { retry: false, note: "工作区推理 hook 明确拒绝请求" },
+    tooManyDenials: { retry: false, note: "拒绝次数过多，需要处理拒绝原因" },
     cyberPolicy: { retry: false, note: "安全政策拒絕" },
     bioPolicy: { retry: false, note: "安全政策拒絕" },
     misalignmentPolicyViolation: { retry: false, note: "政策拒絕，重試無用" },
@@ -109,15 +108,18 @@
     interrupted: { retry: false, note: "用戶主動中斷，不要背著人重跑" },
   };
 
-  // 上面那張表的權威來源（測試會逐一檢查有沒有漏）。順序就是二進位裡 enum 的順序。
+  // 当前协议与旧版变体的兼容清单；真实协议另由独立样本验证。
   const ALL_ERROR_VARIANTS = [
     "contextWindowExceeded",
     "sessionBudgetExceeded",
     "usageLimitExceeded",
     "rateLimitExceeded",
+    "flexUnavailable",
     "serverOverloaded",
     "modelNotFound",
     "policyCapacityUnavailable",
+    "inferenceHookDenied",
+    "tooManyDenials",
     "cyberPolicy",
     "bioPolicy",
     "misalignmentPolicyViolation",
@@ -299,7 +301,7 @@
     attempts: 3, // 同一筆錯誤最多試幾次救援
   };
 
-  const HOOK_VERSION = "2026-11-13.chunked-ipc-v1";
+  const HOOK_VERSION = "2026-11-15.codex-26.1111-v1";
   const HOST_CHUNK_MARKER = "codex-host-chunked-message-v1";
 
   // 26.1106 的宿主会把大消息拆成 token 分片，window message 不再总是完整信封。
@@ -599,6 +601,7 @@
     return null;
   }
 
+  let stopped = false;
   const brain = makeBrain(CFG);
   const log = [];
   const lastWhy = new Map(); // key -> 上次記過的理由，一樣就不重複記
@@ -621,6 +624,7 @@
   let sweeps = 0,
     lastSweepAt = 0;
   function sweep() {
+    if (stopped) return;
     sweeps += 1;
     lastSweepAt = Date.now();
     const btns = document.querySelectorAll(
@@ -707,6 +711,7 @@
         let tries = 0;
         const scheduleBg = () => {
           setTimeout(() => {
+            if (stopped) return; // 热换后旧脚本不能继续发送已排队的重试。
             const st = threads.get(tid);
             if (!st || st.handled || st.at !== myErrAt) return; // 已處理或已有新錯誤接手
             const d2 = brain.decide(cfgKey);
@@ -794,7 +799,7 @@
   function rpc(method, params, timeoutMs) {
     return new Promise((resolve) => {
       const bridge = window.electronBridge;
-      if (!bridge || typeof bridge.sendMessageFromView !== "function") {
+      if (stopped || !bridge || typeof bridge.sendMessageFromView !== "function") {
         resolve(null);
         return;
       }
@@ -829,10 +834,11 @@
   // 從 thread/read + rollout 重建模板；救不到回 null（不寫快取、不送）
   // 只有救到 collaborationMode 才算成功 —— 沒有它就可能把 Plan mode 偷偷切回 default。
   function recoverTemplate(threadId) {
-    if (!RECOVER.enabled) return Promise.resolve(null);
+    if (stopped || !RECOVER.enabled) return Promise.resolve(null);
     const short = threadId.slice(0, 8);
     return rpc("thread/read", { threadId }, 8000)
       .then((res) => {
+        if (stopped) return null;
         const info = res && (res.thread || res);
         if (!info) {
           note("救模板 thread/read 沒回應 " + short);
@@ -855,6 +861,7 @@
           return null;
         }
         return rpc("fs/readFile", { path: info.path }, 15000).then((file) => {
+          if (stopped) return null;
           const b64 = file && file.dataBase64;
           if (!b64) {
             note("救模板 fs/readFile 沒回應 " + short);
@@ -891,6 +898,10 @@
   }
 
   function sendWithTemplate(threadId, tpl, finish) {
+    if (stopped || !backgroundSend) {
+      finish(false);
+      return;
+    }
     const short = threadId.slice(0, 8);
     const bridge = window.electronBridge;
     if (!bridge || typeof bridge.sendMessageFromView !== "function") {
@@ -925,6 +936,10 @@
   function sendMinimalRetry(threadId, finish) {
     const short = threadId.slice(0, 8);
     rpc("thread/read", { threadId }).then((res) => {
+      if (stopped || !backgroundSend) {
+        finish(false);
+        return;
+      }
       const info = res && (res.thread || res);
       if (!info || !info.cwd) {
         note("bg thread/read 沒有可用資訊 " + short);
@@ -965,7 +980,7 @@
       if (typeof done === "function") done(ok);
     };
     const short = threadId.slice(0, 8);
-    if (!backgroundSend) {
+    if (stopped || !backgroundSend) {
       note("bg 已停用，跳過 " + short);
       finish(false);
       return;
@@ -1055,6 +1070,10 @@
     // 目前偵測到有錯誤在身上的 thread（含背景的）
     threads: () => Object.fromEntries(threads),
     stop() {
+      if (stopped) return;
+      stopped = true;
+      backgroundSend = false;
+      RECOVER.enabled = false;
       hostDecoder.clear();
       clearInterval(timer);
       mo.disconnect();
